@@ -1,0 +1,15 @@
+# 與 Torch 2.5 相容的一般科學套件
+numpy>=1.26,<3.0
+pandas>=2.2,<3.0
+matplotlib>=3.9,<3.10
+Pillow>=10.0
+
+# 你的功能套件（新版）
+beautifulsoup4>=4.12
+requests>=2.31
+yfinance>=0.2.40
+psycopg[binary]>=3.1
+
+# 時間序列框架（新版）
+pytorch-lightning>=2.4,<2.6
+pytorch-forecasting==1.5.0
