@@ -38,6 +38,7 @@ import torch.utils.data as data_utils
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 from pathlib import Path
+from data import load_data as load_tft_data
 
 ##############################
 
@@ -162,6 +163,13 @@ class TFT:
         self.model = None
         self.batch_size =16
 
+    def load_data_external(self):
+        """
+        Load training/validation datasets via external data module (data.py).
+        """
+        self.training, self.validation = load_tft_data()
+
+    # NOTE: kept for reference; data loading moved to data.py::load_data
     def load_data(self):
         """
         Load data using the FTSEDataSet class
@@ -488,7 +496,8 @@ class TFT:
 
 def tft():
     tft = TFT()
-    tft.load_data()
+    # load data via external module (data.py)
+    tft.load_data_external()
     tft.create_tft_model()
     tft.train()
     #torch.save(tft,"Model.pickle")
