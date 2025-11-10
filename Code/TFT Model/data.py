@@ -11,18 +11,10 @@ import datetime as dt
 import warnings
 from bisect import bisect_left
 from pathlib import Path
-from typing import List, Optional, Tuple, Set
+from typing import Dict, List, Optional, Tuple, Set
 
 import numpy as np
 import pandas as pd
-
-try:
-    import holidays
-except ImportError as exc:
-    raise ImportError(
-        "python-holidays is required for holiday-based features. "
-        "Install it via `pip install holidays`."
-    ) from exc
 
 from dateutil.relativedelta import relativedelta
 
@@ -30,6 +22,8 @@ from pytorch_forecasting import TimeSeriesDataSet
 from pytorch_forecasting.data.encoders import NaNLabelEncoder
 
 warnings.filterwarnings("ignore")
+
+WEEKEND_RULE_START = dt.date(2001, 1, 1)
 
 
 # 將不同格式的輸入統一轉成日期物件，方便後續切片
@@ -47,23 +41,31 @@ def _coerce_date(value: Optional[object]) -> Optional[dt.date]:
     raise TypeError(f"Unsupported date type: {type(value)}")
 
 
-def _build_tw_holiday_calendar(start_year: int, end_year: int) -> holidays.HolidayBase:
-    years = list(range(start_year, end_year + 1))
-    return holidays.Taiwan(years=years)
-
-
-def _is_tw_rest_day(day: dt.date, holiday_calendar: holidays.HolidayBase) -> bool:
-    return day in holiday_calendar or day.weekday() >= 5
-
-
-def _days_until_next_rest_day(
+def _is_market_rest_day(
     day: dt.date,
-    holiday_calendar: holidays.HolidayBase,
+    trading_history: Set[dt.date],
+    history_last_day: Optional[dt.date],
+    future_rest_days: Set[dt.date],
+) -> bool:
+    if history_last_day and day <= history_last_day:
+        return day not in trading_history
+    if day in future_rest_days:
+        return True
+    if day >= WEEKEND_RULE_START and day.weekday() >= 5:
+        return True
+    return False
+
+
+def _days_until_next_market_rest_day(
+    day: dt.date,
+    trading_history: Set[dt.date],
+    history_last_day: Optional[dt.date],
+    future_rest_days: Set[dt.date],
     max_lookahead: int = 31,
 ) -> int:
     for offset in range(0, max_lookahead + 1):
         candidate = day + dt.timedelta(days=offset)
-        if _is_tw_rest_day(candidate, holiday_calendar):
+        if _is_market_rest_day(candidate, trading_history, history_last_day, future_rest_days):
             return offset
     return max_lookahead
 
@@ -138,6 +140,7 @@ class TXFuturesFeatureBuilder:
             if settlement_calendar_path
             else project_root / "Data" / "TX_settlement_calendar.csv"
         )
+        self.market_holiday_path = project_root / "Data" / "TX_market_holidays.csv"
         base_export_dir = (
             Path(export_dir)
             if export_dir
@@ -153,10 +156,8 @@ class TXFuturesFeatureBuilder:
         self.start_date = _coerce_date(start_date) or dt.date(2010, 1, 1)
         self.end_date = _coerce_date(end_date)
 
-        holiday_end_year = (self.end_date or dt.date.today()).year + 2
-        holiday_start_year = min(self.start_date.year, holiday_end_year - 10)
-        # 預先建立對應年份的台灣國定假日行事曆
-        self.tw_holidays = _build_tw_holiday_calendar(holiday_start_year, holiday_end_year)
+        self.market_rest_days = self._load_market_holidays()
+        self.market_holiday_set: Set[dt.date] = set(self.market_rest_days)
 
         # 台積電除息日名單僅在初始化時讀一次，後續直接使用
         self.tsmc_exdiv_dates = self._load_tsmc_exdiv_dates()
@@ -180,6 +181,7 @@ class TXFuturesFeatureBuilder:
             "week_of_year",
             "days_until_holiday",
             "is_taiwan_holiday",
+            "calendar_days_until_settlement",
             "days_until_settlement",
             "is_settlement_day",
             "calendar_days_until_tsmc_exdiv",
@@ -189,6 +191,8 @@ class TXFuturesFeatureBuilder:
         self.dataframe: Optional[pd.DataFrame] = None
         self.future_dataframe: Optional[pd.DataFrame] = None
         self.future_horizon: int = 0
+        self.history_last_trading_day: Optional[dt.date] = None
+        self.history_trading_day_set: Set[dt.date] = set()
 
     def _load_raw(self) -> pd.DataFrame:
         if not self.data_path.exists():
@@ -242,44 +246,104 @@ class TXFuturesFeatureBuilder:
         self,
         df: pd.DataFrame,
         trading_days: Optional[List[dt.date]] = None,
+        history_last_day: Optional[dt.date] = None,
+        historical_trading_set: Optional[Set[dt.date]] = None,
     ) -> pd.DataFrame:
         daily_dates = df["date"].dt.date
         if trading_days is None:
             trading_days = list(daily_dates)
         trading_days_sorted = sorted(set(trading_days))
         if trading_days_sorted:
-            last_trading_day = trading_days_sorted[-1]
-            future_events = [evt for evt in self.tsmc_exdiv_dates if evt > last_trading_day]
+            inferred_last_day = trading_days_sorted[-1]
+            if history_last_day is None:
+                history_last_day = inferred_last_day
+            future_events = {
+                evt
+                for evt in (self.tsmc_exdiv_dates + self.settlement_dates)
+                if evt > inferred_last_day
+            }
             if future_events:
                 max_event = max(future_events)
-                day = last_trading_day
+                day = inferred_last_day
                 extra_days: List[dt.date] = []
                 while day < max_event:
                     day += dt.timedelta(days=1)
-                    if _is_tw_rest_day(day, self.tw_holidays):
+                    if self._is_future_rest_day(day):
                         continue
                     extra_days.append(day)
                 if extra_days:
-                    # Extend trading index to cover upcoming ex-dividend dates
+                    # Extend trading index to cover upcoming event dates (settlement / ex-dividend)
                     trading_days_sorted.extend(extra_days)
                     trading_days_sorted = sorted(set(trading_days_sorted))
         trading_pos = {day: idx for idx, day in enumerate(trading_days_sorted)}
 
+        trading_history_set: Set[dt.date]
+        if historical_trading_set is not None:
+            trading_history_set = set(historical_trading_set)
+        else:
+            trading_history_set = {
+                day for day in trading_days_sorted if history_last_day is None or day <= history_last_day
+            }
+        future_rest_days = self.market_holiday_set
+
         # 倒數距離下一個台灣假日或周末還有幾天
         df["days_until_holiday"] = [
-            float(_days_until_next_rest_day(day, self.tw_holidays)) for day in daily_dates
+            float(
+                _days_until_next_market_rest_day(
+                    day,
+                    trading_history_set,
+                    history_last_day,
+                    future_rest_days,
+                )
+            )
+            for day in daily_dates
         ]
-        df["is_taiwan_holiday"] = (df["days_until_holiday"] == 0).astype(int)
+        df["is_taiwan_holiday"] = [
+            int(
+                _is_market_rest_day(
+                    day,
+                    trading_history_set,
+                    history_last_day,
+                    future_rest_days,
+                )
+            )
+            for day in daily_dates
+        ]
 
         # 台指期結算日倒數與指示（優先使用外部行事曆）
-        settlement_countdowns: List[float] = []
+        calendar_settlement_countdowns: List[float] = []
         for day in daily_dates:
             val = _days_until_next_settlement(day, self.settlement_dates)
             if pd.isna(val):
                 val = _days_until_next_settlement(day, None)
-            settlement_countdowns.append(float(val))
-        df["days_until_settlement"] = settlement_countdowns
+            calendar_settlement_countdowns.append(float(val))
+        df["calendar_days_until_settlement"] = calendar_settlement_countdowns
         df["is_settlement_day"] = [1 if day in self.settlement_set else 0 for day in daily_dates]
+        settlement_positions = [
+            trading_pos[evt] for evt in self.settlement_dates if evt in trading_pos
+        ]
+        settlement_positions.sort()
+        settlement_trading_countdowns: List[float] = []
+        for day in daily_dates:
+            current_pos = trading_pos.get(day)
+            if current_pos is None:
+                settlement_trading_countdowns.append(np.nan)
+                continue
+            idx = bisect_left(settlement_positions, current_pos)
+            if idx < len(settlement_positions):
+                settlement_trading_countdowns.append(float(settlement_positions[idx] - current_pos))
+            else:
+                settlement_trading_countdowns.append(np.nan)
+        settlement_trading_series = pd.Series(settlement_trading_countdowns, dtype="float")
+        if settlement_trading_series.notna().any():
+            settlement_trading_series = settlement_trading_series.fillna(
+                float(settlement_trading_series.dropna().max())
+            )
+        else:
+            settlement_trading_series = settlement_trading_series.fillna(
+                float(len(trading_days_sorted))
+            )
+        df["days_until_settlement"] = settlement_trading_series
 
         # 台積電除息日倒數與指示
         exdiv_countdowns = [
@@ -326,6 +390,122 @@ class TXFuturesFeatureBuilder:
         df["target_close_t1"] = df["close"].shift(-1)
         df = df.dropna(subset=["target_open_t1", "target_close_t1"])
         return df.reset_index(drop=True)
+
+    def _load_market_holidays(self) -> List[dt.date]:
+        records: Dict[dt.date, Dict[str, str]] = {}
+        if self.market_holiday_path.exists():
+            try:
+                df = pd.read_csv(self.market_holiday_path, dtype={"description": str, "source": str})
+                dates = pd.to_datetime(df["date"], errors="coerce").dt.date
+                for entry_date, row in zip(dates, df.to_dict("records")):
+                    if not isinstance(entry_date, dt.date):
+                        continue
+                    desc = (row.get("description") or "").strip()
+                    source = (row.get("source") or "manual").strip() or "manual"
+                    records[entry_date] = {"description": desc, "source": source}
+                if records:
+                    print(
+                        f"[data] Loaded {len(records)} market holidays from {self.market_holiday_path}"
+                    )
+            except Exception as exc:
+                warnings.warn(f"讀取市場休市日清單失敗：{exc}")
+
+        today = dt.date.today()
+        start_year = max(2000, min(self.start_date.year, today.year))
+        end_basis = self.end_date or (today + dt.timedelta(days=365 * 2))
+        end_year = max(end_basis.year, today.year)
+        existing_years = {day.year for day in records}
+        missing_years = [year for year in range(start_year, end_year + 1) if year not in existing_years]
+
+        fetched_any = False
+        for year in missing_years:
+            fetched = self._fetch_twse_market_holidays(year)
+            if not fetched:
+                continue
+            fetched_any = True
+            for day, info in fetched.items():
+                if day in records and records[day].get("source", "").lower() != "manual":
+                    records[day] = info
+                elif day not in records:
+                    records[day] = info
+
+        if fetched_any:
+            try:
+                rows = []
+                for day in sorted(records):
+                    info = records[day]
+                    rows.append(
+                        {
+                            "date": day.isoformat(),
+                            "description": info.get("description", ""),
+                            "source": info.get("source", "") or "manual",
+                        }
+                    )
+                df = pd.DataFrame(rows)
+                self.market_holiday_path.parent.mkdir(parents=True, exist_ok=True)
+                df.to_csv(self.market_holiday_path, index=False)
+                print(
+                    f"[data] Market holiday calendar updated with {len(rows)} entries -> {self.market_holiday_path}"
+                )
+            except Exception as exc:
+                warnings.warn(f"寫入市場休市日清單失敗：{exc}")
+
+        if not records:
+            warnings.warn("沒有可用的市場休市日資料，僅使用周末與國定假日。")
+            return []
+        return sorted(records)
+
+    def _is_future_rest_day(self, day: dt.date) -> bool:
+        return _is_market_rest_day(
+            day,
+            self.history_trading_day_set,
+            self.history_last_trading_day,
+            self.market_holiday_set,
+        )
+
+    def _fetch_twse_market_holidays(self, year: int) -> Dict[dt.date, Dict[str, str]]:
+        try:
+            import requests
+        except ImportError:
+            warnings.warn("requests 未安裝，無法自動下載市場休市日。")
+            return {}
+
+        url = "https://www.twse.com.tw/holidaySchedule/holidaySchedule"
+        params = {"response": "json", "queryYear": year}
+        try:
+            response = requests.get(url, params=params, timeout=15)
+            response.raise_for_status()
+            payload = response.json()
+        except Exception as exc:
+            warnings.warn(f"下載 {year} 年市場休市日資料失敗：{exc}")
+            return {}
+
+        entries: Dict[dt.date, Dict[str, str]] = {}
+        for raw in payload.get("data", []):
+            if not raw or len(raw) < 3:
+                continue
+            date_str, name, note = raw[0], raw[1], raw[2]
+            if not date_str:
+                continue
+            merged_text = f"{name or ''}{note or ''}"
+            if any(keyword in merged_text for keyword in ["開始交易", "最後交易", "恢復交易", "開始辦理交易"]):
+                continue
+            try:
+                holiday_date = dt.datetime.strptime(date_str, "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            description_parts = []
+            if name:
+                description_parts.append(str(name).strip())
+            if note:
+                note_clean = str(note).strip()
+                if note_clean and note_clean not in description_parts:
+                    description_parts.append(note_clean)
+            description = "；".join(description_parts)
+            entries[holiday_date] = {"description": description, "source": "TWSE"}
+        if entries:
+            print(f"[data] Downloaded {len(entries)} TWSE market holidays for {year}.")
+        return entries
 
     def _load_tsmc_exdiv_dates(self) -> List[dt.date]:
         manual_dates: Set[dt.date] = set()
@@ -487,6 +667,7 @@ class TXFuturesFeatureBuilder:
             "week_of_year",
             "days_until_holiday",
             "is_taiwan_holiday",
+            "calendar_days_until_settlement",
             "days_until_settlement",
             "is_settlement_day",
             "calendar_days_until_tsmc_exdiv",
@@ -497,6 +678,12 @@ class TXFuturesFeatureBuilder:
         ]
         columns_order = [col for col in columns_order if col in df.columns]
         self.dataframe = df[columns_order]
+        if not self.dataframe.empty:
+            self.history_last_trading_day = self.dataframe["date"].dt.date.max()
+            self.history_trading_day_set = set(self.dataframe["date"].dt.date)
+        else:
+            self.history_last_trading_day = None
+            self.history_trading_day_set = set()
         return self.dataframe
 
     def print_summary(self, rows: int = 5) -> None:
@@ -515,6 +702,7 @@ class TXFuturesFeatureBuilder:
             "close",
             "days_until_holiday",
             "is_taiwan_holiday",
+            "calendar_days_until_settlement",
             "days_until_settlement",
             "is_settlement_day",
             "calendar_days_until_tsmc_exdiv",
@@ -550,7 +738,7 @@ class TXFuturesFeatureBuilder:
         added = 0
         while added < horizon:
             day += dt.timedelta(days=1)
-            if skip_rest_days and _is_tw_rest_day(day, self.tw_holidays):
+            if skip_rest_days and self._is_future_rest_day(day):
                 continue
             rows.append({"date": pd.Timestamp(day), "symbol": symbol})
             added += 1
@@ -558,7 +746,12 @@ class TXFuturesFeatureBuilder:
         future_df = pd.DataFrame(rows)
         future_df = self._add_temporal_columns(future_df, base_date=base_date)
         combined_trading_days = self.dataframe["date"].dt.date.tolist() + future_df["date"].dt.date.tolist()
-        future_df = self._add_event_features(future_df, trading_days=combined_trading_days)
+        future_df = self._add_event_features(
+            future_df,
+            trading_days=combined_trading_days,
+            history_last_day=self.history_last_trading_day,
+            historical_trading_set=self.history_trading_day_set,
+        )
 
         # 未來視角下，觀測特徵與目標值仍未知，先以 NaN 佔位
         for col in self.observed_reals:
@@ -718,7 +911,7 @@ def load_data(
 
 
 if __name__ == "__main__":
-    builder = TXFuturesFeatureBuilder(start_date="2015-01-01", export_full=True)
+    builder = TXFuturesFeatureBuilder(start_date="1998-07-21", export_full=True)
     df = builder.prepare_dataframe()
     builder.print_summary()
     builder.prepare_future_dataframe(horizon=30)
