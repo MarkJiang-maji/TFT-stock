@@ -1,0 +1,2 @@
+settlement_date,delivery_month,contract,contract_name,source,fetched_at
+2025-10-15,202510,TX,臺股期貨,https://openapi.taifex.com.tw/v1/SettledPositionsOfContractsOnExpirationDate,2025-11-10T03:10:50

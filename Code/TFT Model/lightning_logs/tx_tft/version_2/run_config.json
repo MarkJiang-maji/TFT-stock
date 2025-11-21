@@ -1,0 +1,31 @@
+{
+  "task_type": "classification",
+  "target_column": "target_intraday_up",
+  "prediction_length": 1,
+  "encoder_length": 120,
+  "future_horizon": 30,
+  "train_fraction": 0.8,
+  "batch_size": 64,
+  "max_epochs": 50,
+  "learning_rate": 0.001,
+  "hidden_size": 64,
+  "attention_head_size": 4,
+  "hidden_continuous_size": 32,
+  "dropout": 0.1,
+  "lstm_layers": 1,
+  "reduce_on_plateau_patience": 8,
+  "classification_threshold": 0.5,
+  "start_date": "2015-01-01",
+  "end_date": null,
+  "features_csv": "outputs/tx_feature.csv",
+  "device": "CPU",
+  "dataset": {
+    "num_rows": 2640,
+    "date_start": "2015-01-05",
+    "date_end": "2025-10-23",
+    "start_date": "2015-01-01",
+    "end_date": null,
+    "train_fraction": 0.8,
+    "features_csv": "outputs/tx_feature.csv"
+  }
+}

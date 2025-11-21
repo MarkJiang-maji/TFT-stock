@@ -19,6 +19,7 @@ import pandas as pd
 from dateutil.relativedelta import relativedelta
 
 from pytorch_forecasting import TimeSeriesDataSet
+from pytorch_forecasting.data import GroupNormalizer
 from pytorch_forecasting.data.encoders import NaNLabelEncoder
 
 warnings.filterwarnings("ignore")
@@ -140,11 +141,12 @@ class TXFuturesFeatureBuilder:
             if settlement_calendar_path
             else project_root / "Data" / "TX_settlement_calendar.csv"
         )
+        self.settlement_webcrawl_path = project_root / "Data" / "TX_settlement_calendar_webcrawl.csv"
         self.market_holiday_path = project_root / "Data" / "TX_market_holidays.csv"
         base_export_dir = (
             Path(export_dir)
             if export_dir
-            else Path(__file__).resolve().parent / "outputs"
+            else Path(__file__).resolve().parent / "data_output"
         )
         if not base_export_dir.is_absolute():
             base_export_dir = Path(__file__).resolve().parent / base_export_dir
@@ -172,6 +174,8 @@ class TXFuturesFeatureBuilder:
             "close",
             "volume",
             "return_close_pct",
+            "intraday_return",
+            "intraday_return_pct",
         ]
         # time_varying_known_reals: 透過日曆或事件邏輯可事先知道的特徵
         self.known_future_reals = [
@@ -193,6 +197,7 @@ class TXFuturesFeatureBuilder:
         self.future_horizon: int = 0
         self.history_last_trading_day: Optional[dt.date] = None
         self.history_trading_day_set: Set[dt.date] = set()
+        self.training_cutoff: Optional[int] = None
 
     def _load_raw(self) -> pd.DataFrame:
         if not self.data_path.exists():
@@ -240,6 +245,10 @@ class TXFuturesFeatureBuilder:
 
     def _add_return_columns(self, df: pd.DataFrame) -> pd.DataFrame:
         df["return_close_pct"] = df["close"].pct_change().fillna(0.0)
+        df["intraday_return"] = df["close"] - df["open"]
+        intraday_pct = df["intraday_return"] / df["open"].replace(0, np.nan)
+        intraday_pct = intraday_pct.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        df["intraday_return_pct"] = intraday_pct
         return df
 
     def _add_event_features(
@@ -389,6 +398,12 @@ class TXFuturesFeatureBuilder:
         df["target_open_t1"] = df["open"].shift(-1)
         df["target_close_t1"] = df["close"].shift(-1)
         df = df.dropna(subset=["target_open_t1", "target_close_t1"])
+        diff = df["target_close_t1"] - df["target_open_t1"]
+        df["target_intraday_diff"] = diff
+        pct = diff / df["target_open_t1"].replace(0, np.nan)
+        pct = pct.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        df["target_intraday_return_pct"] = pct
+        df["target_intraday_up"] = (diff > 0).astype(int)
         return df.reset_index(drop=True)
 
     def _load_market_holidays(self) -> List[dt.date]:
@@ -454,6 +469,68 @@ class TXFuturesFeatureBuilder:
             warnings.warn("沒有可用的市場休市日資料，僅使用周末與國定假日。")
             return []
         return sorted(records)
+
+    def _load_webcrawl_settlement_dates(self) -> List[dt.date]:
+        if not self.settlement_webcrawl_path.exists():
+            print(
+                f"[data] Webcrawl settlement file not found: {self.settlement_webcrawl_path}"
+            )
+            return []
+        try:
+            df = pd.read_csv(self.settlement_webcrawl_path)
+        except Exception as exc:
+            warnings.warn(f"讀取結算爬蟲檔案失敗：{exc}")
+            return []
+        if "settlement_date" not in df.columns:
+            warnings.warn(f"{self.settlement_webcrawl_path} 缺少 settlement_date 欄位。")
+            return []
+        dates = pd.to_datetime(df["settlement_date"], errors="coerce").dropna().dt.date
+        web_dates = sorted(set(dates))
+        if web_dates:
+            print(
+                f"[data] Loaded {len(web_dates)} settlement dates from webcrawl source {self.settlement_webcrawl_path}"
+            )
+        else:
+            warnings.warn(f"{self.settlement_webcrawl_path} 沒有有效的結算日期。")
+        return web_dates
+
+    def _validate_settlement_sources(
+        self,
+        primary_dates: List[dt.date],
+        webcrawl_dates: List[dt.date],
+    ) -> None:
+        if not webcrawl_dates:
+            return
+        def build_map(dates: List[dt.date]) -> Dict[Tuple[int, int], dt.date]:
+            return {(d.year, d.month): d for d in dates}
+
+        primary_map = build_map(primary_dates)
+        web_map = build_map(webcrawl_dates)
+        mismatches: List[str] = []
+        missing_notifications: List[str] = []
+        for key in sorted(set(primary_map) | set(web_map)):
+            manual = primary_map.get(key)
+            crawled = web_map.get(key)
+            if manual is None or crawled is None:
+                missing_notifications.append(
+                    f"{key[0]}-{key[1]:02d}: "
+                    f"{'manual missing' if manual is None else 'webcrawl missing'}"
+                )
+                continue
+            if manual != crawled:
+                mismatches.append(
+                    f"{key[0]}-{key[1]:02d}: manual={manual.isoformat()} vs webcrawl={crawled.isoformat()}"
+                )
+        if mismatches:
+            raise ValueError(
+                "TX settlement calendar mismatch between local CSV and web-crawl results:\n"
+                + "\n".join(mismatches)
+            )
+        if missing_notifications:
+            print(
+                "[data] Webcrawl settlement coverage incomplete; missing months:\n"
+                + "\n".join(missing_notifications)
+            )
 
     def _is_future_rest_day(self, day: dt.date) -> bool:
         return _is_market_rest_day(
@@ -562,6 +639,7 @@ class TXFuturesFeatureBuilder:
         讀取台指期正式結算日清單；若檔案不存在則按第三個星期三規則產生。
         載回的日期會被排序並去重。
         """
+        webcrawl_dates = self._load_webcrawl_settlement_dates()
         if self.settlement_calendar_path.exists():
             try:
                 df = pd.read_csv(self.settlement_calendar_path)
@@ -575,6 +653,7 @@ class TXFuturesFeatureBuilder:
                 dates = pd.to_datetime(df[col], errors="coerce").dropna().dt.date
                 cleaned = sorted(set(dates))
                 if cleaned:
+                    self._validate_settlement_sources(cleaned, webcrawl_dates)
                     print(
                         f"[data] Loaded {len(cleaned)} TX settlement dates from {self.settlement_calendar_path}"
                     )
@@ -598,6 +677,7 @@ class TXFuturesFeatureBuilder:
             f"{len(generated)} TX settlement dates by rule-of-thumb (3rd Wednesday).\n"
             f"    -> 建議以官方列表覆蓋 {self.settlement_calendar_path} 後重新載入。"
         )
+        self._validate_settlement_sources(generated, webcrawl_dates)
         try:
             df = pd.DataFrame({"settlement_date": [d.isoformat() for d in generated]})
             self.settlement_calendar_path.parent.mkdir(parents=True, exist_ok=True)
@@ -641,6 +721,17 @@ class TXFuturesFeatureBuilder:
             warnings.warn(f"Failed to download TSMC dividend data: {exc}")
             return []
 
+    def _finalize_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.sort_values("time_idx").reset_index(drop=True)
+        self.dataframe = df
+        if not df.empty:
+            self.history_last_trading_day = df["date"].dt.date.max()
+            self.history_trading_day_set = set(df["date"].dt.date)
+        else:
+            self.history_last_trading_day = None
+            self.history_trading_day_set = set()
+        return self.dataframe
+
     def prepare_dataframe(self) -> pd.DataFrame:
         df = self._load_raw()
         df = self._filter_by_dates(df)
@@ -649,7 +740,6 @@ class TXFuturesFeatureBuilder:
         df = self._add_event_features(df, trading_days=trading_days)
         df = self._add_return_columns(df)
         df = self._add_targets(df)
-        df = df.sort_values("time_idx").reset_index(drop=True)
 
         columns_order = [
             "date",
@@ -661,6 +751,8 @@ class TXFuturesFeatureBuilder:
             "close",
             "volume",
             "return_close_pct",
+            "intraday_return",
+            "intraday_return_pct",
             "day_of_week",
             "day_of_month",
             "month",
@@ -675,16 +767,80 @@ class TXFuturesFeatureBuilder:
             "is_tsmc_exdiv",
             "target_open_t1",
             "target_close_t1",
+            "target_intraday_diff",
+            "target_intraday_return_pct",
+            "target_intraday_up",
         ]
         columns_order = [col for col in columns_order if col in df.columns]
-        self.dataframe = df[columns_order]
-        if not self.dataframe.empty:
-            self.history_last_trading_day = self.dataframe["date"].dt.date.max()
-            self.history_trading_day_set = set(self.dataframe["date"].dt.date)
-        else:
-            self.history_last_trading_day = None
-            self.history_trading_day_set = set()
-        return self.dataframe
+        df = df[columns_order]
+        return self._finalize_dataframe(df)
+
+    def load_feature_dataframe(self, csv_path: Optional[object]) -> pd.DataFrame:
+        """
+        Load a pre-computed feature csv (e.g., tx_feature.csv) instead of rebuilding from raw TX data.
+        """
+        if csv_path is None:
+            raise ValueError("csv_path is required when loading pre-computed features.")
+        target_path = Path(csv_path)
+        if target_path.suffix.lower() != ".csv":
+            target_path = target_path.with_suffix(".csv")
+        candidate_paths = [target_path]
+        if target_path.name == "tx_feature.csv":
+            candidate_paths.append(target_path.with_name("tx_features.csv"))
+        if not target_path.exists():
+            fallback = next((path for path in candidate_paths if path.exists()), None)
+            if fallback is None:
+                raise FileNotFoundError(f"Cannot locate feature csv at {target_path}")
+            target_path = fallback
+            print(f"[data] Using fallback feature csv: {target_path}")
+        df = pd.read_csv(target_path)
+        required_cols = {"date", "symbol", "time_idx", "target_intraday_up"}
+        missing = required_cols - set(df.columns)
+        if missing:
+            raise KeyError(f"Feature csv missing columns: {sorted(missing)}")
+        df["date"] = pd.to_datetime(df["date"])
+        df["symbol"] = df["symbol"].fillna("TX").astype(str)
+        if df["time_idx"].dtype.kind not in {"i", "u"}:
+            df["time_idx"] = df["time_idx"].round().astype(int)
+        if self.start_date:
+            df = df[df["date"] >= pd.Timestamp(self.start_date)]
+        if self.end_date:
+            df = df[df["date"] <= pd.Timestamp(self.end_date)]
+        df = df.reset_index(drop=True)
+        if df.empty:
+            raise ValueError(
+                f"Filtered feature dataframe is empty after applying date range "
+                f"{self.start_date} -> {self.end_date}."
+            )
+        missing_observed = [col for col in self.observed_reals if col not in df.columns]
+        missing_known = [col for col in self.known_future_reals if col not in df.columns]
+        if missing_observed:
+            raise KeyError(f"Feature csv missing observed columns: {missing_observed}")
+        if missing_known:
+            raise KeyError(f"Feature csv missing known future columns: {missing_known}")
+        target_cols = [
+            "target_open_t1",
+            "target_close_t1",
+            "target_intraday_diff",
+            "target_intraday_return_pct",
+            "target_intraday_up",
+        ]
+        for col in target_cols:
+            if col not in df.columns:
+                raise KeyError(f"Feature csv missing target column: {col}")
+        df = df[
+            [
+                "date",
+                "symbol",
+                "time_idx",
+                *self.observed_reals,
+                *self.known_future_reals,
+                *target_cols,
+            ]
+        ]
+        self.future_dataframe = None
+        self.future_horizon = 0
+        return self._finalize_dataframe(df)
 
     def print_summary(self, rows: int = 5) -> None:
         if self.dataframe is None:
@@ -700,6 +856,8 @@ class TXFuturesFeatureBuilder:
             "date",
             "open",
             "close",
+            "intraday_return",
+            "intraday_return_pct",
             "days_until_holiday",
             "is_taiwan_holiday",
             "calendar_days_until_settlement",
@@ -710,6 +868,9 @@ class TXFuturesFeatureBuilder:
             "is_tsmc_exdiv",
             "target_open_t1",
             "target_close_t1",
+            "target_intraday_diff",
+            "target_intraday_return_pct",
+            "target_intraday_up",
         ]
         preview_cols = [c for c in preview_cols if c in df.columns]
         print(df[preview_cols].head(rows))
@@ -758,6 +919,9 @@ class TXFuturesFeatureBuilder:
             future_df[col] = np.nan
         future_df["target_open_t1"] = np.nan
         future_df["target_close_t1"] = np.nan
+        future_df["target_intraday_diff"] = np.nan
+        future_df["target_intraday_return_pct"] = np.nan
+        future_df["target_intraday_up"] = np.nan
 
         # 依據訓練資料欄位順序整理，缺少的欄位補 NaN
         for col in self.dataframe.columns:
@@ -817,10 +981,12 @@ class TXFuturesFeatureBuilder:
 
     def build_time_series_datasets(
         self,
-        target: str = "target_close_t1",
+        target: str = "target_intraday_up",
         max_prediction_length: int = 5,
         max_encoder_length: int = 120,
         min_encoder_length: Optional[int] = None,
+        task_type: str = "classification",
+        train_fraction: float = 0.8,
     ) -> Tuple[TimeSeriesDataSet, TimeSeriesDataSet]:
         if self.dataframe is None:
             raise ValueError("Dataframe not prepared. Call prepare_dataframe() first.")
@@ -828,16 +994,37 @@ class TXFuturesFeatureBuilder:
         if target not in df.columns:
             raise KeyError(f"Target column '{target}' not found in dataframe.")
 
+        task_type = (task_type or "classification").lower()
+        if task_type not in {"classification", "regression"}:
+            raise ValueError("task_type must be either 'classification' or 'regression'.")
+
         min_encoder_length = min_encoder_length or max_encoder_length // 2
-        training_cutoff = int(df["time_idx"].max() - max_prediction_length)
+        min_time_idx = int(df["time_idx"].min())
+        max_time_idx = int(df["time_idx"].max())
+        if max_time_idx - min_time_idx <= max_prediction_length:
+            raise ValueError(
+                "Not enough data to create train/validation split with the requested horizon."
+            )
+        default_cutoff = max_time_idx - max_prediction_length
+        training_cutoff = default_cutoff
+        if 0.0 < train_fraction < 1.0:
+            total_span = max_time_idx - min_time_idx + 1
+            ratio_cutoff = min_time_idx + int(total_span * train_fraction) - 1
+            training_cutoff = max(min(ratio_cutoff, default_cutoff), min_time_idx)
+        self.training_cutoff = training_cutoff
 
         unknown_reals = [col for col in self.observed_reals if col != target]
         known_reals = [col for col in self.known_future_reals if col in df.columns]
 
         print(
             f"[TFT] N={len(df)}, encoder={min_encoder_length}-{max_encoder_length}, "
-            f"prediction={max_prediction_length}, training_cutoff={training_cutoff}"
+            f"prediction={max_prediction_length}, training_cutoff={training_cutoff}, "
+            f"train_fraction={train_fraction:.2f}"
         )
+
+        target_normalizer = None
+        if task_type == "regression":
+            target_normalizer = GroupNormalizer(groups=["symbol"])
 
         training = TimeSeriesDataSet(
             df.loc[lambda x: x["time_idx"] <= training_cutoff],
@@ -854,9 +1041,10 @@ class TXFuturesFeatureBuilder:
             max_prediction_length=max_prediction_length,
             categorical_encoders={"symbol": NaNLabelEncoder().fit(df["symbol"])},
             add_relative_time_idx=True,
-            add_target_scales=True,
+            add_target_scales=target_normalizer is not None,
             add_encoder_length=True,
             allow_missing_timesteps=True,
+            target_normalizer=target_normalizer,
         )
 
         validation = TimeSeriesDataSet.from_dataset(
@@ -871,7 +1059,7 @@ class TXFuturesFeatureBuilder:
 def load_data(
     start_date: Optional[object] = "2010-01-01",
     end_date: Optional[object] = None,
-    target: str = "target_close_t1",
+    target: str = "target_intraday_up",
     prediction_length: int = 5,
     encoder_length: int = 120,
     export_preview: bool = True,
@@ -880,6 +1068,9 @@ def load_data(
     future_horizon: int = 0,
     skip_future_rest_days: bool = True,
     return_builder: bool = False,
+    task_type: str = "classification",
+    features_csv: Optional[object] = None,
+    train_fraction: float = 0.8,
 ):
     # 封裝流程：建立特徵、輸出預覽，再回傳 TFT 所需的 train/val dataset 與原始資料框
     builder = TXFuturesFeatureBuilder(
@@ -888,7 +1079,10 @@ def load_data(
         preview_rows=preview_rows,
         export_full=export_full,
     )
-    df = builder.prepare_dataframe()
+    if features_csv:
+        df = builder.load_feature_dataframe(features_csv)
+    else:
+        df = builder.prepare_dataframe()
     builder.print_summary(rows=min(5, len(df)))
     future_df = None
     if future_horizon > 0:
@@ -896,12 +1090,14 @@ def load_data(
             horizon=future_horizon,
             skip_rest_days=skip_future_rest_days,
         )
-    if export_preview:
+    if export_preview and not features_csv:
         builder.export()
     training, validation = builder.build_time_series_datasets(
         target=target,
         max_prediction_length=prediction_length,
         max_encoder_length=encoder_length,
+        task_type=task_type,
+        train_fraction=train_fraction,
     )
     if future_df is not None:
         df.attrs["future_known_inputs"] = future_df
