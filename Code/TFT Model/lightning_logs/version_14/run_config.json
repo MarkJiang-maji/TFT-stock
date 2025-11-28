@@ -1,0 +1,86 @@
+{
+  "task_type": "classification",
+  "target_column": "target_intraday_up",
+  "prediction_length": 1,
+  "encoder_length": 120,
+  "future_horizon": 30,
+  "train_fraction": 0.95,
+  "batch_size": 64,
+  "max_epochs": 80,
+  "learning_rate": 0.0004,
+  "hidden_size": 160,
+  "attention_head_size": 4,
+  "hidden_continuous_size": 64,
+  "dropout": 0.03,
+  "lstm_layers": 1,
+  "reduce_on_plateau_patience": 8,
+  "classification_threshold": 0.5,
+  "weight_decay": 0.0,
+  "pos_weight": 0.73,
+  "start_date": "2015-01-01",
+  "end_date": null,
+  "features_csv": null,
+  "device": "NVIDIA GeForce RTX 4090",
+  "logger_version": 14,
+  "monitor_metric": "val_best_accuracy",
+  "monitor_mode": "max",
+  "seed": 42,
+  "early_stopping_patience": 30,
+  "splits": {
+    "train": {
+      "time_idx_min": 0,
+      "time_idx_max": 3746,
+      "date_start": "2015-01-05",
+      "date_end": "2025-04-08"
+    },
+    "val": {
+      "time_idx_min": 3747,
+      "time_idx_max": 3944,
+      "date_start": "2025-04-09",
+      "date_end": "2025-10-23"
+    },
+    "future": {
+      "time_idx_min": 3945,
+      "time_idx_max": 3974,
+      "date_start": "2025-10-27",
+      "date_end": "2025-12-05"
+    }
+  },
+  "dataset": {
+    "num_rows": 2640,
+    "date_start": "2015-01-05",
+    "date_end": "2025-10-23",
+    "start_date": "2015-01-01",
+    "end_date": null,
+    "train_fraction": 0.95,
+    "features_csv": null
+  },
+  "training": {
+    "best_checkpoint": "/mnt/c/Users/A52560/Documents/GitHub/TFT-stock/Code/TFT Model/lightning_logs/version_14/checkpoints/tft-01-0.7151.ckpt",
+    "best_monitor_score": 0.7150837779045105,
+    "best_epoch": 1,
+    "actual_max_epochs": 80,
+    "epochs_trained": 33,
+    "monitor_metric": "val_best_accuracy",
+    "monitor_mode": "max"
+  },
+  "last_evaluation": {
+    "samples": 115,
+    "overall_accuracy": 0.45217391304347826,
+    "positive_rate": 0.5565217391304348,
+    "prediction_rate": 0.8434782608695652,
+    "threshold_used": 0.37,
+    "best_val_threshold": 0.37,
+    "best_val_accuracy": 0.6173913043478261,
+    "last_30_accuracy": 0.43333333333333335,
+    "true_positives": 49,
+    "false_positives": 48,
+    "true_negatives": 3,
+    "false_negatives": 15,
+    "precision": 0.5051546391752577,
+    "recall": 0.765625,
+    "f1": 0.6086956521739131,
+    "roc_auc": 0.45496323529411764,
+    "pr_auc": 0.5377450056158503
+  }
+}

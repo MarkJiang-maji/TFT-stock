@@ -1,0 +1,19 @@
+{
+  "samples": 115,
+  "overall_accuracy": 0.4434782608695652,
+  "positive_rate": 0.5565217391304348,
+  "prediction_rate": 0.12173913043478261,
+  "threshold_used": 0.48,
+  "best_val_threshold": 0.48,
+  "best_val_accuracy": 0.6173913043478261,
+  "last_30_accuracy": 0.4,
+  "true_positives": 7,
+  "false_positives": 7,
+  "true_negatives": 44,
+  "false_negatives": 57,
+  "precision": 0.5,
+  "recall": 0.109375,
+  "f1": 0.1794871794871795,
+  "roc_auc": 0.4641544117647059,
+  "pr_auc": 0.5465898059199158
+}

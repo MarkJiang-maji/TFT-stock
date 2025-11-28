@@ -31,6 +31,7 @@ from pytorch_forecasting.metrics import MultiHorizonMetric, QuantileLoss
 from data import load_data as load_tft_data
 
 warnings.filterwarnings("ignore")  # reduce noisy warnings from libs
+torch.set_float32_matmul_precision("high")  # enable tensor cores for float32 matmul when available
 
 _CUDA_USABLE: Optional[bool] = None
 
@@ -160,8 +161,14 @@ class TrainingMetricsLogger(Callback):
         for key in (
             "train_accuracy",
             "train_bce",
+            "train_precision",
+            "train_recall",
+            "train_f1",
             "val_accuracy",
             "val_bce",
+            "val_precision",
+            "val_recall",
+            "val_f1",
             "val_best_accuracy",
             "val_best_threshold",
         ):
@@ -281,8 +288,10 @@ class TFT:
         weight_decay: float = 0.0,
         logger_name: Optional[str] = None,
         logger_version: Optional[int] = None,
-        monitor_metric: str = "val_bce",
+        monitor_metric: str = "val_f1",
         monitor_mode: Optional[Literal["min", "max"]] = None,
+        seed: Optional[int] = 42,
+        early_stopping_patience: int = 10,
     ) -> None:
         self.prediction_length = prediction_length
         self.encoder_length = encoder_length
@@ -316,6 +325,8 @@ class TFT:
         self.logger_version = logger_version
         self.monitor_metric = monitor_metric
         self.monitor_mode = monitor_mode
+        self.seed = seed
+        self.early_stopping_patience = early_stopping_patience
 
         self.base_dir = Path(__file__).resolve().parent
         self.log_root = self.base_dir / "lightning_logs"
@@ -330,6 +341,7 @@ class TFT:
         self.checkpoint_callback: Optional[ModelCheckpoint] = None
         self.best_checkpoint_path: Optional[str] = None
         self.training_cutoff: Optional[int] = None
+        self.training_summary: Dict[str, object] = {}
 
         self.dataframe: Optional[pd.DataFrame] = None
         self.future_known_inputs: Optional[pd.DataFrame] = None
@@ -420,6 +432,28 @@ class TFT:
         self.training_cutoff = getattr(builder, "training_cutoff", None)
         self.dataframe = df
         self.future_known_inputs = df.attrs.get("future_known_inputs")
+        # Export a quick snapshot of the prepared dataset (and splits) before feeding to the model.
+        # This helps verify the exact rows/features used for training/validation.
+        try:
+            snapshot_root = self.artifact_dir or (self.run_dir / "artifacts")
+            snapshot_root.mkdir(parents=True, exist_ok=True)
+            snapshot_path = snapshot_root / "data_snapshot.csv"
+            df.to_csv(snapshot_path, index=False)
+            if self.training_cutoff is not None and not df.empty:
+                train_df = df[df["time_idx"] <= self.training_cutoff]
+                val_df = df[df["time_idx"] > self.training_cutoff]
+                train_df.to_csv(snapshot_root / "train_snapshot.csv", index=False)
+                val_df.to_csv(snapshot_root / "val_snapshot.csv", index=False)
+                # Masked val snapshot (removes observed price/volume features to show what the model cannot see in future)
+                known_future_cols = list(getattr(self.training, "time_varying_known_reals", [])) if self.training else []
+                masked_cols = ["date", "symbol", "time_idx", self.target_column]
+                masked_cols.extend([c for c in known_future_cols if c not in masked_cols])
+                masked_cols = [c for c in masked_cols if c in val_df.columns]
+                masked_val = val_df[masked_cols].copy()
+                masked_val.to_csv(snapshot_root / "val_snapshot_masked.csv", index=False)
+            print(f"[data] snapshot saved -> {snapshot_root}")
+        except Exception as exc:
+            print(f"[data] snapshot export skipped: {exc}")
         if hasattr(self.training, "time_varying_unknown_reals"):
             self.observed_reals_config = list(getattr(self.training, "time_varying_unknown_reals", []))
         if not df.empty:
@@ -466,14 +500,15 @@ class TFT:
         if self.training is None:
             raise RuntimeError("Call load_data_external() before creating the model.")
 
-        monitor_metric = self.monitor_metric or "val_bce"
-        monitor_mode = self.monitor_mode
-        if monitor_mode is None:
-            monitor_mode = "max" if "accuracy" in monitor_metric else "min"
+        # Always monitor F1 for checkpoint/early stopping to reflect balanced precision/recall.
+        monitor_metric = "val_f1"
+        monitor_mode = "max"
+        if self.seed is not None:
+            L.seed_everything(self.seed, workers=True)
         early_stop_callback = EarlyStopping(
             monitor=monitor_metric,
             min_delta=1e-4,
-            patience=10,
+            patience=self.early_stopping_patience,
             mode=monitor_mode,
         )
         lr_logger = LearningRateMonitor(logging_interval="epoch")
@@ -519,6 +554,7 @@ class TFT:
             max_epochs=self.max_epochs,
             accelerator=accelerator,
             devices=1,
+            precision="bf16-mixed",  # use BF16 AMP to gain speed while avoiding FP16 mask overflow
             gradient_clip_val=0.1,
             callbacks=callbacks,
             logger=logger,
@@ -595,11 +631,15 @@ class TFT:
             "logger_version": self.logger_version,
             "monitor_metric": self.monitor_metric,
             "monitor_mode": self.monitor_mode,
+            "seed": self.seed,
+            "early_stopping_patience": self.early_stopping_patience,
         }
         if splits:
             config["splits"] = splits
         if self.dataset_summary:
             config["dataset"] = self.dataset_summary
+        if self.training_summary:
+            config["training"] = self.training_summary
         config_path = self.run_dir / "run_config.json"
         with config_path.open("w", encoding="utf-8") as fp:
             json.dump(config, fp, indent=2, ensure_ascii=False)
@@ -734,6 +774,20 @@ class TFT:
             "best_threshold": best_thresh,
             "samples": float(len(horizon_df)),
         }
+        # precision / recall / f1 at the default threshold
+        tp = int(((preds_default == 1) & (actual == 1)).sum())
+        fp = int(((preds_default == 1) & (actual == 0)).sum())
+        fn = int(((preds_default == 0) & (actual == 1)).sum())
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+        metrics.update(
+            {
+                "precision": float(precision),
+                "recall": float(recall),
+                "f1": float(f1),
+            }
+        )
         if split == "val" and best_thresh is not None:
             # Keep the global best validation threshold so later evaluation matches the best checkpoint.
             is_better = (
@@ -762,6 +816,21 @@ class TFT:
                 score_val = float(score)
             score_str = f"{score_val:.6f}" if score_val is not None else "n/a"
             print(f"[train] best checkpoint -> {best_path} (val_loss={score_str})")
+            # 將訓練摘要記錄下來，方便 run_config.json 回溯
+            best_epoch_hint: Optional[int] = None
+            try:
+                best_epoch_hint = int(best_path.stem.split("-")[1])
+            except Exception:
+                pass
+            self.training_summary = {
+                "best_checkpoint": str(best_path),
+                "best_monitor_score": score_val,
+                "best_epoch": best_epoch_hint,
+                "actual_max_epochs": self.trainer.max_epochs if self.trainer else None,
+                "epochs_trained": (self.trainer.current_epoch + 1) if self.trainer else None,
+                "monitor_metric": self.monitor_metric,
+                "monitor_mode": self.monitor_mode,
+            }
 
         if self.metrics_tracker and self.metrics_tracker.history:
             df = pd.DataFrame(self.metrics_tracker.history).sort_values("epoch")
@@ -769,6 +838,9 @@ class TFT:
                 df["train_accuracy"] = np.nan
             if "val_accuracy" not in df.columns:
                 df["val_accuracy"] = np.nan
+            for col in ["train_precision", "train_recall", "train_f1", "val_precision", "val_recall", "val_f1"]:
+                if col not in df.columns:
+                    df[col] = np.nan
             if "val_best_threshold" not in df.columns:
                 df["val_best_threshold"] = np.nan
             metrics_csv = save_root / "training_metrics.csv"
@@ -806,11 +878,29 @@ class TFT:
                 fig_acc.savefig(acc_path, dpi=200)
                 plt.close(fig_acc)
                 artifacts["accuracy_plot"] = acc_path
+            if df[["train_f1", "val_f1"]].notna().any().any():
+                fig_f1, ax_f1 = plt.subplots(figsize=(7, 4))
+                ax_f1.set_title("TFT F1 history")
+                ax_f1.set_xlabel("Epoch")
+                ax_f1.set_ylabel("F1 score")
+                if df["train_f1"].notna().any():
+                    ax_f1.plot(df["epoch"], df["train_f1"], label="train_f1", marker="o", linewidth=1.3)
+                if df["val_f1"].notna().any():
+                    ax_f1.plot(df["epoch"], df["val_f1"], label="val_f1", marker="s", linewidth=1.3)
+                ax_f1.grid(True, linestyle="--", alpha=0.3)
+                ax_f1.legend()
+                f1_path = save_root / "training_f1_curve.png"
+                fig_f1.tight_layout()
+                fig_f1.savefig(f1_path, dpi=200)
+                plt.close(fig_f1)
+                artifacts["f1_plot"] = f1_path
             print(f"[train] saved metrics CSV -> {metrics_csv}")
             print(f"[train] saved loss curve -> {fig_path}")
         else:
             print("[train] metrics tracker empty, skipping loss export.")
 
+        # 重新寫入 run_config.json，包含訓練摘要/seed/early stopping 等資訊
+        self._record_run_config()
         return artifacts
 
     def _compute_split_accuracy(self, split: Literal["train", "val"]) -> Optional[float]:
@@ -967,15 +1057,15 @@ class TFT:
                     rows.append(row)
         return rows
 
-    def _summarize_classification_metrics(self, df: pd.DataFrame, save_dir: Path) -> None:
+    def _summarize_classification_metrics(self, df: pd.DataFrame, save_dir: Path) -> Optional[Dict[str, object]]:
         if self.task_type != "classification":
-            return
+            return None
         if not {"actual", "prob_up"}.issubset(df.columns):
-            return
+            return None
         horizon_df = df[df["horizon_step"] == 1].copy()
         horizon_df = horizon_df.dropna(subset=["actual", "prob_up"])
         if horizon_df.empty:
-            return
+            return None
         horizon_df["actual"] = horizon_df["actual"].astype(int)
         threshold = self._effective_threshold()
         horizon_df["pred_label"] = (horizon_df["prob_up"] >= threshold).astype(int)
@@ -997,6 +1087,25 @@ class TFT:
         summary["false_positives"] = int(((horizon_df["pred_label"] == 1) & (horizon_df["actual"] == 0)).sum())
         summary["true_negatives"] = int(((horizon_df["pred_label"] == 0) & (horizon_df["actual"] == 0)).sum())
         summary["false_negatives"] = int(((horizon_df["pred_label"] == 0) & (horizon_df["actual"] == 1)).sum())
+        # Precision / recall / F1
+        tp = summary["true_positives"]
+        fp = summary["false_positives"]
+        fn = summary["false_negatives"]
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        summary["precision"] = float(precision)
+        summary["recall"] = float(recall)
+        summary["f1"] = float(2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+        # Ranking metrics (useful to debug precision/recall trade-offs)
+        try:
+            from sklearn.metrics import roc_auc_score, average_precision_score
+
+            summary["roc_auc"] = float(roc_auc_score(horizon_df["actual"], horizon_df["prob_up"]))
+            summary["pr_auc"] = float(average_precision_score(horizon_df["actual"], horizon_df["prob_up"]))
+        except Exception as exc:
+            summary["roc_auc"] = None
+            summary["pr_auc"] = None
+            print(f"[eval] AUC metrics skipped: {exc}")
         metrics_path = save_dir / "classification_metrics.json"
         with metrics_path.open("w", encoding="utf-8") as fp:
             json.dump(summary, fp, indent=2, ensure_ascii=False)
@@ -1008,6 +1117,7 @@ class TFT:
                 summary["positive_rate"],
             )
         )
+        return summary
 
     def evaluate(
         self,
@@ -1057,8 +1167,33 @@ class TFT:
             df.to_csv(fallback, index=False)
             print(f"[eval] original file locked ({exc}); fallback saved -> {fallback}")
             output_path = fallback
-        self._summarize_classification_metrics(df, save_path)
+        summary = self._summarize_classification_metrics(df, save_path)
+        try:
+            self._update_run_config_eval_metrics(summary)
+        except Exception as exc:
+            print(f"[eval] failed to update run_config with eval metrics: {exc}")
         return output_path
+
+    def _update_run_config_eval_metrics(self, metrics: Optional[Dict[str, object]]) -> None:
+        """
+        Persist the latest evaluation summary into run_config.json for reproducibility.
+        """
+        if metrics is None or self.run_dir is None:
+            return
+        run_config_path = self.run_dir / "run_config.json"
+        if not run_config_path.exists():
+            return
+        try:
+            with run_config_path.open("r", encoding="utf-8") as fp:
+                cfg = json.load(fp)
+        except Exception:
+            return
+        cfg["last_evaluation"] = metrics
+        try:
+            with run_config_path.open("w", encoding="utf-8") as fp:
+                json.dump(cfg, fp, indent=2, ensure_ascii=False)
+        except Exception as exc:
+            print(f"[eval] unable to write eval metrics to run_config: {exc}")
 
     def predict_future(
         self,
