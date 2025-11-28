@@ -1,0 +1,11 @@
+{
+  "samples": 52,
+  "overall_accuracy": 0.5192307692307693,
+  "positive_rate": 0.5769230769230769,
+  "prediction_rate": 0.3269230769230769,
+  "last_30_accuracy": 0.4666666666666667,
+  "true_positives": 11,
+  "false_positives": 6,
+  "true_negatives": 16,
+  "false_negatives": 19
+}

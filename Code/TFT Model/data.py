@@ -906,6 +906,10 @@ class TXFuturesFeatureBuilder:
 
         future_df = pd.DataFrame(rows)
         future_df = self._add_temporal_columns(future_df, base_date=base_date)
+        # 將 time_idx 直接延續歷史最後一筆，避免不同基準日期導致尺度不一致
+        last_time_idx = int(self.dataframe["time_idx"].max())
+        future_df["time_idx"] = range(last_time_idx + 1, last_time_idx + 1 + len(future_df))
+
         combined_trading_days = self.dataframe["date"].dt.date.tolist() + future_df["date"].dt.date.tolist()
         future_df = self._add_event_features(
             future_df,
@@ -1052,6 +1056,8 @@ class TXFuturesFeatureBuilder:
             df,
             predict=True,
             stop_randomization=True,
+            # hold out strictly after the training cutoff to avoid leakage
+            min_prediction_idx=training_cutoff + 1,
         )
         return training, validation
 
@@ -1071,13 +1077,16 @@ def load_data(
     task_type: str = "classification",
     features_csv: Optional[object] = None,
     train_fraction: float = 0.8,
+    export_dir: Optional[object] = None,
 ):
     # 封裝流程：建立特徵、輸出預覽，再回傳 TFT 所需的 train/val dataset 與原始資料框
+    export_dir_path = Path(export_dir).expanduser() if export_dir is not None else None
     builder = TXFuturesFeatureBuilder(
         start_date=start_date,
         end_date=end_date,
         preview_rows=preview_rows,
         export_full=export_full,
+        export_dir=export_dir_path,
     )
     if features_csv:
         df = builder.load_feature_dataframe(features_csv)

@@ -7,12 +7,12 @@
 
 from __future__ import annotations
 
-import warnings
 import os
 import sys
 import datetime as dt
+import warnings
 from pathlib import Path
-from typing import Dict, List, Literal, Optional
+from typing import Dict, Iterable, List, Literal, Optional, Set, Tuple
 
 import matplotlib
 matplotlib.use("Agg")
@@ -70,15 +70,41 @@ class BinaryCrossEntropyLoss(MultiHorizonMetric):
     BCE loss wrapper that follows the MultiHorizonMetric interface used by TFT.
     """
 
-    def __init__(self, reduction: str = "mean") -> None:
+    def __init__(self, reduction: str = "mean", pos_weight: Optional[float] = None) -> None:
         super().__init__(reduction=reduction)
+        self.pos_weight = pos_weight
 
     def loss(self, y_pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         logits = y_pred[..., 0]
         target = target.float()
         if target.ndim > logits.ndim:
             target = target.squeeze(-1)
-        losses = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+        pos_w: Optional[torch.Tensor] = None
+        if self.pos_weight is not None:
+            pos_w = torch.as_tensor(self.pos_weight, device=logits.device, dtype=logits.dtype)
+        losses = F.binary_cross_entropy_with_logits(logits, target, reduction="none", pos_weight=pos_w)
+        return losses.unsqueeze(-1)
+
+    def to_prediction(self, y_pred: torch.Tensor) -> torch.Tensor:
+        return torch.sigmoid(y_pred)
+
+
+class BinaryAccuracy(MultiHorizonMetric):
+    """
+    Classification accuracy at a fixed threshold for TFT logging_metrics.
+    """
+
+    def __init__(self, threshold: float = 0.5, reduction: str = "mean") -> None:
+        super().__init__(reduction=reduction)
+        self.threshold = float(threshold)
+
+    def loss(self, y_pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        probs = torch.sigmoid(y_pred[..., 0])
+        target = target.float()
+        if target.ndim > probs.ndim:
+            target = target.squeeze(-1)
+        correct = (probs >= self.threshold) == (target >= 0.5)
+        losses = (~correct).float()
         return losses.unsqueeze(-1)
 
     def to_prediction(self, y_pred: torch.Tensor) -> torch.Tensor:
@@ -87,6 +113,7 @@ class BinaryCrossEntropyLoss(MultiHorizonMetric):
 
 try:  # ensure checkpoints saved under __main__ can be reloaded when imported as a module
     sys.modules["__main__"].BinaryCrossEntropyLoss = BinaryCrossEntropyLoss
+    sys.modules["__main__"].BinaryAccuracy = BinaryAccuracy
 except Exception:
     pass
 
@@ -130,13 +157,82 @@ class TrainingMetricsLogger(Callback):
                 record["lr"] = float(optimizer.param_groups[0]["lr"])
         except Exception:
             pass
+        for key in (
+            "train_accuracy",
+            "train_bce",
+            "val_accuracy",
+            "val_bce",
+            "val_best_accuracy",
+            "val_best_threshold",
+        ):
+            record[key] = self._to_float(metrics.get(key))
         self.history.append(record)
 
 
-def build_task_config(task_type: str) -> Dict[str, object]:
+class ClassificationEpochEvaluator(Callback):
+    """
+    Compute per-epoch train/val accuracy + BCE (with threshold sweep) and log to TensorBoard.
+    """
+
+    def __init__(
+        self,
+        owner: "TFT",
+        thresholds: Optional[Iterable[float]] = None,
+        train_eval_batches: Optional[int] = None,
+    ) -> None:
+        super().__init__()
+        self.owner = owner
+        self.thresholds = list(thresholds) if thresholds is not None else [x / 100 for x in range(10, 91, 1)]
+        self.train_eval_batches = train_eval_batches
+
+    def _log_scalars(self, trainer: L.Trainer, prefix: str, metrics: Dict[str, float]) -> None:
+        logger = trainer.logger
+        writer = getattr(logger, "experiment", None)
+        if writer is None:
+            return
+        step = trainer.current_epoch
+        for key, value in metrics.items():
+            if value is None:
+                continue
+            writer.add_scalar(f"{prefix}/{key}", value, step)
+
+    def on_validation_epoch_end(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:  # type: ignore[override]
+        if getattr(trainer, "sanity_checking", False):
+            return
+        owner = self.owner
+        if owner.validation is None or owner.training is None:
+            return
+        val_metrics = owner._evaluate_split_metrics(
+            pl_module,
+            split="val",
+            thresholds=self.thresholds,
+            trainer=trainer,
+        )
+        train_metrics = owner._evaluate_split_metrics(
+            pl_module,
+            split="train",
+            thresholds=self.thresholds,
+            trainer=trainer,
+            max_batches=self.train_eval_batches,
+        )
+        for metrics, split_prefix in ((train_metrics, "train"), (val_metrics, "val")):
+            if not metrics:
+                continue
+            metrics_prefixed = {f"{split_prefix}_{k}": v for k, v in metrics.items()}
+            trainer.callback_metrics.update(
+                {
+                    k: torch.tensor(v, device=pl_module.device)  # type: ignore[arg-type]
+                    for k, v in metrics_prefixed.items()
+                    if v is not None
+                }
+            )
+            self._log_scalars(trainer, prefix=split_prefix, metrics=metrics)
+
+
+def build_task_config(task_type: str, pos_weight: Optional[float] = None) -> Dict[str, object]:
     task = (task_type or "classification").lower()
     if task == "classification":
-        loss = BinaryCrossEntropyLoss()
+        loss = BinaryCrossEntropyLoss(pos_weight=pos_weight)
         return {
             "task_type": task,
             "target": "target_intraday_up",
@@ -164,6 +260,7 @@ class TFT:
         prediction_length: int = 5,
         encoder_length: int = 120,
         task_type: str = "classification",
+        pos_weight: Optional[float] = None,
         future_horizon: Optional[int] = None,
         skip_future_rest_days: bool = True,
         batch_size: int = 64,
@@ -181,7 +278,11 @@ class TFT:
         dropout: float = 0.1,
         lstm_layers: int = 1,
         reduce_on_plateau_patience: int = 8,
-        logger_name: str = "tx_tft",
+        weight_decay: float = 0.0,
+        logger_name: Optional[str] = None,
+        logger_version: Optional[int] = None,
+        monitor_metric: str = "val_bce",
+        monitor_mode: Optional[Literal["min", "max"]] = None,
     ) -> None:
         self.prediction_length = prediction_length
         self.encoder_length = encoder_length
@@ -189,14 +290,18 @@ class TFT:
         self.skip_future_rest_days = skip_future_rest_days
         self.batch_size = batch_size
         self.num_workers = max(0, num_workers)
-        self.task_config = build_task_config(task_type)
+        self.task_config = build_task_config(task_type, pos_weight=pos_weight)
         self.task_type = self.task_config["task_type"]
         self.target_column = self.task_config["target"]
         self.classification_threshold = classification_threshold
+        self.best_val_threshold: Optional[float] = None
+        self.best_val_accuracy: Optional[float] = None
+        self.threshold_grid: List[float] = [x / 100 for x in range(10, 91, 1)]  # 0.10~0.90, step 0.01
         self.start_date = start_date
         self.end_date = end_date
         self.features_csv = Path(features_csv).expanduser() if features_csv else None
-        self.train_fraction = max(0.0, min(float(train_fraction), 0.95))
+        # 允許更大的訓練比例以手動保留極短的驗證窗口（例如僅留 60 天）
+        self.train_fraction = max(0.0, min(float(train_fraction), 0.995))
         self.max_epochs = max_epochs
         self.learning_rate = learning_rate
         self.hidden_size = hidden_size
@@ -205,7 +310,17 @@ class TFT:
         self.dropout = dropout
         self.lstm_layers = lstm_layers
         self.reduce_on_plateau_patience = reduce_on_plateau_patience
+        self.weight_decay = max(0.0, float(weight_decay))
         self.logger_name = logger_name
+        # 預設集中到指定版本資料夾（如 version_3），可自行覆寫
+        self.logger_version = logger_version
+        self.monitor_metric = monitor_metric
+        self.monitor_mode = monitor_mode
+
+        self.base_dir = Path(__file__).resolve().parent
+        self.log_root = self.base_dir / "lightning_logs"
+        self.run_dir = self._prepare_run_dir()
+        self.artifact_dir = self.run_dir / "artifacts"
 
         self.training = None
         self.validation = None
@@ -219,16 +334,50 @@ class TFT:
         self.dataframe: Optional[pd.DataFrame] = None
         self.future_known_inputs: Optional[pd.DataFrame] = None
         self.date_lookup: Dict[int, str] = {}
+        self._historical_time_idx_keys: List[int] = []
+        self._time_idx_keys: List[int] = []
         self.symbol: str = "TX"
         self.tensorboard_logger: Optional[TensorBoardLogger] = None
-        self.run_dir: Optional[Path] = None
-        self.artifact_dir = Path("data_output")
         self.dataset_summary: Dict[str, object] = {}
         self.observed_reals_config: List[str] = []
+
+    def _prepare_run_dir(self) -> Path:
+        """
+        Pre-compute the logging/artefact directory so every output stays under
+        the same lightning version folder.
+        """
+        if self.logger_name:
+            name_root = (self.log_root / self.logger_name).resolve()
+        else:
+            name_root = self.log_root.resolve()
+        name_root.mkdir(parents=True, exist_ok=True)
+        version = self.logger_version
+        if version is None:
+            version = self._next_logger_version(name_root)
+            self.logger_version = version
+        run_dir = name_root / f"version_{version}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        return run_dir
+
+    @staticmethod
+    def _next_logger_version(root: Path) -> int:
+        existing: List[int] = []
+        for child in root.iterdir():
+            if child.is_dir() and child.name.startswith("version_"):
+                try:
+                    existing.append(int(child.name.split("_", 1)[1]))
+                except ValueError:
+                    continue
+        return max(existing) + 1 if existing else 0
 
     # ------------------------------------------------------------------#
     # Data / model helpers
     # ------------------------------------------------------------------#
+    def _effective_threshold(self) -> float:
+        if self.best_val_threshold is not None:
+            return float(self.best_val_threshold)
+        return float(self.classification_threshold)
+
     def load_data_external(
         self,
         start_date: Optional[str] = None,
@@ -236,6 +385,7 @@ class TFT:
         export_preview: bool = True,
         export_full: bool = True,
         features_csv: Optional[str] = None,
+        export_dir: Optional[str] = None,
     ) -> None:
         """
         Prepare TimeSeriesDataSet instances via data.py.
@@ -248,6 +398,9 @@ class TFT:
         if isinstance(feature_path, Path):
             feature_path = feature_path.expanduser()
             self.features_csv = feature_path
+        export_root = Path(export_dir).expanduser() if export_dir else None
+        if export_root:
+            export_root.mkdir(parents=True, exist_ok=True)
         self.training, self.validation, df, builder = load_tft_data(
             start_date=start,
             end_date=end,
@@ -261,6 +414,7 @@ class TFT:
             task_type=self.task_type,
             features_csv=str(feature_path) if feature_path else None,
             train_fraction=self.train_fraction,
+            export_dir=export_root,
             return_builder=True,
         )
         self.training_cutoff = getattr(builder, "training_cutoff", None)
@@ -276,8 +430,12 @@ class TFT:
                 .astype(str)
                 .to_dict()
             )
+            self._historical_time_idx_keys = sorted(self.date_lookup)
+            self._time_idx_keys = sorted(self.date_lookup)
         else:
             self.date_lookup = {}
+            self._historical_time_idx_keys = []
+            self._time_idx_keys = []
         if (
             isinstance(self.future_known_inputs, pd.DataFrame)
             and not self.future_known_inputs.empty
@@ -289,6 +447,7 @@ class TFT:
                 .to_dict()
             )
             self.date_lookup.update(future_lookup)
+            self._time_idx_keys = sorted(set(self.date_lookup))
         if df is not None and not df.empty:
             self.dataset_summary = {
                 "num_rows": int(len(df)),
@@ -301,36 +460,59 @@ class TFT:
             }
         else:
             self.dataset_summary = {}
+            self._time_idx_keys = []
 
     def create_tft_model(self) -> None:
         if self.training is None:
             raise RuntimeError("Call load_data_external() before creating the model.")
 
+        monitor_metric = self.monitor_metric or "val_bce"
+        monitor_mode = self.monitor_mode
+        if monitor_mode is None:
+            monitor_mode = "max" if "accuracy" in monitor_metric else "min"
         early_stop_callback = EarlyStopping(
-            monitor="val_loss",
+            monitor=monitor_metric,
             min_delta=1e-4,
             patience=10,
-            mode="min",
+            mode=monitor_mode,
         )
         lr_logger = LearningRateMonitor(logging_interval="epoch")
-        logger = TensorBoardLogger(save_dir="lightning_logs", name=self.logger_name)
+        log_root = self.log_root
+        log_root.mkdir(parents=True, exist_ok=True)
+        logger = TensorBoardLogger(
+            save_dir=str(log_root),
+            name=self.logger_name,
+            version=self.logger_version,
+        )
         self.tensorboard_logger = logger
         self.run_dir = Path(logger.log_dir)
+        self.run_dir.mkdir(parents=True, exist_ok=True)
         checkpoint_dir = self.run_dir / "checkpoints"
         self.artifact_dir = self.run_dir / "artifacts"
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
         self.checkpoint_callback = ModelCheckpoint(
             dirpath=str(checkpoint_dir),
-            filename="tft-{epoch:02d}-{val_loss:.4f}",
-            monitor="val_loss",
-            mode="min",
+            filename=f"tft-{{epoch:02d}}-{{{monitor_metric}:.4f}}",
+            monitor=monitor_metric,
+            mode=monitor_mode,
             save_last=True,
             save_top_k=1,
             auto_insert_metric_name=False,
         )
         self.metrics_tracker = TrainingMetricsLogger()
-        callbacks: List[Callback] = [lr_logger, early_stop_callback, self.checkpoint_callback, self.metrics_tracker]
+        epoch_eval_callback = ClassificationEpochEvaluator(
+            owner=self,
+            thresholds=self.threshold_grid,
+            train_eval_batches=10,
+        )
+        callbacks: List[Callback] = [
+            lr_logger,
+            epoch_eval_callback,
+            early_stop_callback,
+            self.checkpoint_callback,
+            self.metrics_tracker,
+        ]
         accelerator = "gpu" if _is_cuda_usable() else "cpu"
 
         self.trainer = L.Trainer(
@@ -345,12 +527,17 @@ class TFT:
         self.model = TemporalFusionTransformer.from_dataset(
             self.training,
             learning_rate=self.learning_rate,
+            optimizer_params={"weight_decay": self.weight_decay} if self.weight_decay > 0 else None,
             hidden_size=self.hidden_size,
             attention_head_size=self.attention_head_size,
             dropout=self.dropout,
             hidden_continuous_size=self.hidden_continuous_size,
             output_size=self.task_config["output_size"],
             loss=self.task_config["loss"],
+            logging_metrics=[
+                BinaryCrossEntropyLoss(pos_weight=getattr(self.task_config["loss"], "pos_weight", None)),
+                BinaryAccuracy(threshold=self.classification_threshold),
+            ],
             lstm_layers=self.lstm_layers,
             reduce_on_plateau_patience=self.reduce_on_plateau_patience,
         )
@@ -381,6 +568,7 @@ class TFT:
     def _record_run_config(self) -> None:
         if self.run_dir is None:
             return
+        splits = self._build_split_summary()
         config = {
             "task_type": self.task_type,
             "target_column": self.target_column,
@@ -398,20 +586,165 @@ class TFT:
             "lstm_layers": self.lstm_layers,
             "reduce_on_plateau_patience": self.reduce_on_plateau_patience,
             "classification_threshold": self.classification_threshold,
+            "weight_decay": self.weight_decay,
+            "pos_weight": getattr(self.task_config.get("loss"), "pos_weight", None) if isinstance(self.task_config, dict) else None,
             "start_date": self.start_date,
             "end_date": self.end_date,
             "features_csv": str(self.features_csv) if self.features_csv else None,
             "device": _get_pretty_device_name(),
+            "logger_version": self.logger_version,
+            "monitor_metric": self.monitor_metric,
+            "monitor_mode": self.monitor_mode,
         }
+        if splits:
+            config["splits"] = splits
         if self.dataset_summary:
             config["dataset"] = self.dataset_summary
         config_path = self.run_dir / "run_config.json"
         with config_path.open("w", encoding="utf-8") as fp:
             json.dump(config, fp, indent=2, ensure_ascii=False)
 
+    def _collect_prediction_rows(
+        self,
+        model: TemporalFusionTransformer,
+        loader,
+        require_actual: bool,
+    ) -> List[Dict[str, object]]:
+        """
+        Run the model on a dataloader without spawning new loggers and collect rows for downstream processing.
+        """
+        rows: List[Dict[str, object]] = []
+        device = next(model.parameters()).device
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            for batch in loader:
+                if isinstance(batch, (list, tuple)):
+                    batch_inputs = batch[0]
+                else:
+                    batch_inputs = batch
+                batch_inputs = {k: v.to(device) if hasattr(v, "to") else v for k, v in batch_inputs.items()}
+                raw_pred = model(batch_inputs)
+                predictions = getattr(raw_pred, "prediction", None)
+                if predictions is None:
+                    predictions = getattr(raw_pred, "output", raw_pred)
+                if self.task_type == "classification":
+                    predictions = torch.sigmoid(predictions)
+                rows.extend(self._build_prediction_rows(predictions, batch_inputs, model, require_actual=require_actual))
+        if was_training:
+            model.train()
+        return rows
+
     # ------------------------------------------------------------------#
     # Evaluation / prediction export
     # ------------------------------------------------------------------#
+    def _evaluate_split_metrics(
+        self,
+        model: TemporalFusionTransformer,
+        split: Literal["train", "val"],
+        thresholds: Optional[Iterable[float]] = None,
+        trainer: Optional[L.Trainer] = None,
+        max_batches: Optional[int] = None,
+    ) -> Optional[Dict[str, float]]:
+        dataset = self.training if split == "train" else self.validation
+        if (
+            self.training is not None
+            and self.dataframe is not None
+            and self.training_cutoff is not None
+        ):
+            if split == "val":
+                dataset = TimeSeriesDataSet.from_dataset(
+                    self.training,
+                    self.dataframe,
+                    stop_randomization=True,
+                    predict=False,
+                    min_prediction_idx=self.training_cutoff + 1,
+                )
+            elif split == "train":
+                df_train = self.dataframe[self.dataframe["time_idx"] <= self.training_cutoff]
+                dataset = TimeSeriesDataSet.from_dataset(
+                    self.training,
+                    df_train,
+                    stop_randomization=True,
+                    predict=False,
+                    min_prediction_idx=int(df_train["time_idx"].min()) if not df_train.empty else None,
+                )
+        if dataset is None:
+            return None
+        dataloader = dataset.to_dataloader(
+            train=False,
+            batch_size=self.batch_size * 5,
+            num_workers=self.num_workers,
+            pin_memory=True,
+        )
+        rows: List[Dict[str, object]] = []
+        thresholds = list(thresholds) if thresholds is not None else self.threshold_grid
+        device = next(model.parameters()).device
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(dataloader):
+                if max_batches is not None and batch_idx >= max_batches:
+                    break
+                if isinstance(batch, (list, tuple)):
+                    batch_inputs = batch[0]
+                else:
+                    batch_inputs = batch
+                batch_inputs = {k: v.to(device) if hasattr(v, "to") else v for k, v in batch_inputs.items()}
+                raw_pred = model(batch_inputs)
+                predictions = getattr(raw_pred, "prediction", None)
+                if predictions is None:
+                    predictions = getattr(raw_pred, "output", raw_pred)
+                if self.task_type == "classification":
+                    predictions = torch.sigmoid(predictions)
+                rows.extend(self._build_prediction_rows(predictions, batch_inputs, model, require_actual=True))
+        if was_training:
+            model.train()
+        df = pd.DataFrame(rows)
+        if df.empty:
+            return None
+        horizon_df = df[df["horizon_step"] == 1].dropna(subset=["actual", "prob_up"])
+        if split == "val" and self.training_cutoff is not None:
+            horizon_df = horizon_df[horizon_df["time_idx"] > self.training_cutoff]
+        if horizon_df.empty:
+            return None
+        horizon_df = horizon_df.drop_duplicates(subset=["time_idx", "horizon_step"], keep="last")
+        actual = horizon_df["actual"].astype(int)
+        prob = horizon_df["prob_up"].clip(0, 1)
+        base_threshold = self._effective_threshold()
+        preds_default = (prob >= base_threshold).astype(int)
+        accuracy = float((preds_default == actual).mean())
+        bce_tensor = F.binary_cross_entropy(
+            torch.as_tensor(prob.values, dtype=torch.float32),
+            torch.as_tensor(actual.values, dtype=torch.float32),
+        )
+        best_acc = -1.0
+        best_thresh = None
+        for th in thresholds:
+            acc = float(((prob >= th).astype(int) == actual).mean())
+            if acc > best_acc:
+                best_acc = acc
+                best_thresh = float(th)
+        metrics = {
+            "accuracy": accuracy,
+            "bce": float(bce_tensor.detach().cpu().item()),
+            "positive_rate": float(actual.mean()),
+            "prediction_rate": float(preds_default.mean()),
+            "best_accuracy": float(best_acc) if best_acc >= 0 else None,
+            "best_threshold": best_thresh,
+            "samples": float(len(horizon_df)),
+        }
+        if split == "val" and best_thresh is not None:
+            # Keep the global best validation threshold so later evaluation matches the best checkpoint.
+            is_better = (
+                self.best_val_accuracy is None
+                or (best_acc is not None and best_acc > self.best_val_accuracy)
+            )
+            if is_better:
+                self.best_val_threshold = best_thresh
+                self.best_val_accuracy = best_acc
+        return metrics
+
     def _export_training_artifacts(self, save_dir: Optional[str] = None) -> Dict[str, Path]:
         save_root = Path(save_dir) if save_dir else self.artifact_dir
         save_root.mkdir(parents=True, exist_ok=True)
@@ -432,18 +765,12 @@ class TFT:
 
         if self.metrics_tracker and self.metrics_tracker.history:
             df = pd.DataFrame(self.metrics_tracker.history).sort_values("epoch")
-            train_acc = self._compute_split_accuracy("train")
-            val_acc = self._compute_split_accuracy("val")
             if "train_accuracy" not in df.columns:
                 df["train_accuracy"] = np.nan
             if "val_accuracy" not in df.columns:
                 df["val_accuracy"] = np.nan
-            if not df.empty:
-                last_idx = df.index[-1]
-                if train_acc is not None:
-                    df.at[last_idx, "train_accuracy"] = train_acc
-                if val_acc is not None:
-                    df.at[last_idx, "val_accuracy"] = val_acc
+            if "val_best_threshold" not in df.columns:
+                df["val_best_threshold"] = np.nan
             metrics_csv = save_root / "training_metrics.csv"
             df.to_csv(metrics_csv, index=False)
             artifacts["metrics_csv"] = metrics_csv
@@ -463,6 +790,22 @@ class TFT:
             fig.savefig(fig_path, dpi=200)
             plt.close(fig)
             artifacts["metrics_plot"] = fig_path
+            if df[["train_accuracy", "val_accuracy"]].notna().any().any():
+                fig_acc, ax_acc = plt.subplots(figsize=(7, 4))
+                ax_acc.set_title("TFT accuracy history")
+                ax_acc.set_xlabel("Epoch")
+                ax_acc.set_ylabel("Accuracy")
+                if df["train_accuracy"].notna().any():
+                    ax_acc.plot(df["epoch"], df["train_accuracy"], label="train_acc", marker="o", linewidth=1.3)
+                if df["val_accuracy"].notna().any():
+                    ax_acc.plot(df["epoch"], df["val_accuracy"], label="val_acc", marker="s", linewidth=1.3)
+                ax_acc.grid(True, linestyle="--", alpha=0.3)
+                ax_acc.legend()
+                acc_path = save_root / "training_accuracy_curve.png"
+                fig_acc.tight_layout()
+                fig_acc.savefig(acc_path, dpi=200)
+                plt.close(fig_acc)
+                artifacts["accuracy_plot"] = acc_path
             print(f"[train] saved metrics CSV -> {metrics_csv}")
             print(f"[train] saved loss curve -> {fig_path}")
         else:
@@ -513,8 +856,10 @@ class TFT:
             horizon_df = pred_df[pred_df["horizon_step"] == 1].dropna(subset=["actual", "prob_up"])
             if horizon_df.empty:
                 return None
+            horizon_df = horizon_df.drop_duplicates(subset=["time_idx", "horizon_step"], keep="last")
             horizon_df["actual"] = horizon_df["actual"].astype(int)
-            horizon_df["pred_label"] = (horizon_df["prob_up"] >= self.classification_threshold).astype(int)
+            threshold = self._effective_threshold()
+            horizon_df["pred_label"] = (horizon_df["prob_up"] >= threshold).astype(int)
             return float((horizon_df["pred_label"] == horizon_df["actual"]).mean())
         except Exception:
             return None
@@ -603,7 +948,10 @@ class TFT:
                         prob = float(prob_tensor.detach().cpu().item())
                         prob = max(0.0, min(1.0, prob))
                         row["prob_up"] = prob
-                        row["pred_label"] = int(prob >= self.classification_threshold)
+                        threshold = self._effective_threshold()
+                        row["pred_label"] = int(prob >= threshold)
+                        if not actual_missing:
+                            row["correct"] = int(row["pred_label"] == int(actual_val))
                     elif quantiles:
                         pred_array = pred_slice.detach().cpu().tolist()
                         # use median (0.5) if available, else central element
@@ -629,13 +977,17 @@ class TFT:
         if horizon_df.empty:
             return
         horizon_df["actual"] = horizon_df["actual"].astype(int)
-        horizon_df["pred_label"] = (horizon_df["prob_up"] >= self.classification_threshold).astype(int)
+        threshold = self._effective_threshold()
+        horizon_df["pred_label"] = (horizon_df["prob_up"] >= threshold).astype(int)
         horizon_df["correct"] = (horizon_df["pred_label"] == horizon_df["actual"]).astype(int)
         summary = {
             "samples": int(len(horizon_df)),
             "overall_accuracy": float(horizon_df["correct"].mean()),
             "positive_rate": float(horizon_df["actual"].mean()),
             "prediction_rate": float(horizon_df["pred_label"].mean()),
+            "threshold_used": threshold,
+            "best_val_threshold": self.best_val_threshold,
+            "best_val_accuracy": self.best_val_accuracy,
         }
         last_window = horizon_df.sort_values("time_idx").tail(min(30, len(horizon_df)))
         summary["last_30_accuracy"] = (
@@ -685,20 +1037,14 @@ class TFT:
             batch_size=self.batch_size * 10,
             num_workers=self.num_workers,
         )
-        prediction_result = model.predict(
-            val_loader,
-            return_x=True,
-        )
-        predictions = getattr(prediction_result, "output", prediction_result)
-        batch_inputs = getattr(prediction_result, "x", None) or {}
-        rows = self._build_prediction_rows(predictions, batch_inputs, model, require_actual=True)
+        rows = self._collect_prediction_rows(model, val_loader, require_actual=True)
         df = pd.DataFrame(rows).sort_values(["time_idx", "horizon_step"])
         if self.training_cutoff is not None:
             df = df[df["time_idx"] > self.training_cutoff]
+        if not df.empty:
+            df = df.drop_duplicates(subset=["time_idx", "horizon_step"], keep="last")
 
         save_path = Path(save_dir) if save_dir else self.artifact_dir
-        if save_path is None:
-            save_path = Path("data_output")
         save_path.mkdir(parents=True, exist_ok=True)
         if filename is None:
             filename = f"{split_name}_predictions_{self.task_type}.csv"
@@ -742,30 +1088,65 @@ class TFT:
             ignore_index=True,
             sort=False,
         )
-        future_dataset = TimeSeriesDataSet.from_dataset(
-            self.training,
-            combined_df,
-            stop_randomization=True,
-            predict=True,
-        )
-        future_loader = future_dataset.to_dataloader(
+        combined_df = combined_df.sort_values("time_idx").reset_index(drop=True)
+        future_indices = sorted(set(int(x) for x in future_df["time_idx"].tolist()))
+        if not future_indices:
+            print("[future] future_known_inputs 缺少 time_idx，無法推論。")
+            return None
+        future_start_idx = future_indices[0]
+        expected_range = list(range(future_start_idx, future_start_idx + len(future_indices)))
+        missing_known = [idx for idx in expected_range if idx not in future_indices]
+        if missing_known:
+            print(f"[future] 未來特徵缺少 time_idx：{missing_known}")
+        target_window: Set[int] = set(expected_range if not missing_known else future_indices)
+
+        try:
+            forecast_dataset = TimeSeriesDataSet.from_dataset(
+                self.training,
+                combined_df,
+                stop_randomization=True,
+                predict=False,
+                min_prediction_idx=future_start_idx,
+            )
+        except Exception as exc:
+            print(f"[future] 建立推論資料集失敗：{exc}")
+            return None
+
+        forecast_loader = forecast_dataset.to_dataloader(
             train=False,
             batch_size=self.batch_size * 10,
             num_workers=self.num_workers,
         )
-        prediction_result = model.predict(future_loader, return_x=True)
-        predictions = getattr(prediction_result, "output", prediction_result)
-        batch_inputs = getattr(prediction_result, "x", None) or {}
-        rows = self._build_prediction_rows(predictions, batch_inputs, model, require_actual=False)
-        future_start_idx = int(self.future_known_inputs["time_idx"].min())
-        rows = [row for row in rows if row.get("time_idx", -1) >= future_start_idx]
-        if not rows:
+        rows = self._collect_prediction_rows(model, forecast_loader, require_actual=False)
+
+        filtered_rows: List[Dict[str, object]] = []
+        seen: Set[Tuple[int, int]] = set()
+        for row in rows:
+            if row.get("horizon_step") != 1:
+                continue
+            try:
+                time_idx_val = int(row.get("time_idx", -1))
+            except (TypeError, ValueError):
+                continue
+            if time_idx_val < future_start_idx or time_idx_val not in target_window:
+                continue
+            row["actual"] = None
+            row.pop("correct", None)
+            key = (time_idx_val, 1)
+            if key in seen:
+                continue
+            seen.add(key)
+            filtered_rows.append(row)
+
+        missing_preds = sorted(target_window - {r["time_idx"] for r in filtered_rows})
+        if missing_preds:
+            print(f"[future] 缺少以下 time_idx 的預測 (horizon=1): {missing_preds}")
+
+        if not filtered_rows:
             print("[future] 推論結果為空，無法輸出。")
             return None
-        df = pd.DataFrame(rows).sort_values(["time_idx", "horizon_step"])
+        df = pd.DataFrame(filtered_rows).sort_values(["time_idx", "horizon_step"])
         save_path = Path(save_dir) if save_dir else self.artifact_dir
-        if save_path is None:
-            save_path = Path("data_output")
         save_path.mkdir(parents=True, exist_ok=True)
         if filename is None:
             filename = f"future_predictions_{self.task_type}.csv"
@@ -780,9 +1161,55 @@ class TFT:
             output_path = fallback
         return output_path
 
+    def _build_split_summary(self) -> Dict[str, object]:
+        keys = self._historical_time_idx_keys or self._time_idx_keys
+        if not keys:
+            return {}
+        train_cutoff = self.training_cutoff
+        min_idx, max_idx = keys[0], keys[-1]
+
+        def _first_after(idx: int) -> Optional[int]:
+            for k in keys:
+                if k > idx:
+                    return k
+            return None
+
+        def _date(idx: Optional[int]) -> Optional[str]:
+            if idx is None:
+                return None
+            return self.date_lookup.get(idx)
+
+        train_max = max(k for k in keys if train_cutoff is None or k <= train_cutoff)
+        val_min = _first_after(train_cutoff) if train_cutoff is not None else None
+        future_min = None
+        future_max = None
+        if isinstance(self.future_known_inputs, pd.DataFrame) and not self.future_known_inputs.empty:
+            future_min = int(self.future_known_inputs["time_idx"].min())
+            future_max = int(self.future_known_inputs["time_idx"].max())
+
+        return {
+            "train": {
+                "time_idx_min": int(min_idx),
+                "time_idx_max": int(train_max),
+                "date_start": _date(min_idx),
+                "date_end": _date(train_max),
+            },
+            "val": {
+                "time_idx_min": int(val_min) if val_min is not None else None,
+                "time_idx_max": int(max_idx),
+                "date_start": _date(val_min),
+                "date_end": _date(max_idx),
+            },
+            "future": {
+                "time_idx_min": int(future_min) if future_min is not None else None,
+                "time_idx_max": int(future_max) if future_max is not None else None,
+                "date_start": _date(future_min),
+                "date_end": _date(future_max),
+            },
+        }
+
 
 def tft() -> None:
-    features_path = Path("data_output") / "tx_feature.csv"
     predictor = TFT(
         task_type="classification",
         prediction_length=1,
@@ -790,7 +1217,6 @@ def tft() -> None:
         future_horizon=30,
         batch_size=64,
         start_date="2015-01-01",
-        features_csv=features_path,
         train_fraction=0.8,
         max_epochs=50,
         learning_rate=1e-3,

@@ -1,0 +1,14 @@
+{
+  "samples": 433,
+  "overall_accuracy": 0.558891454965358,
+  "positive_rate": 0.5381062355658198,
+  "prediction_rate": 0.9006928406466512,
+  "threshold_used": 0.5,
+  "best_val_threshold": 0.5,
+  "best_val_accuracy": 0.558891454965358,
+  "last_30_accuracy": 0.6,
+  "true_positives": 216,
+  "false_positives": 174,
+  "true_negatives": 26,
+  "false_negatives": 17
+}
