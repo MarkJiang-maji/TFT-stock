@@ -164,6 +164,11 @@ class TrainingMetricsLogger(Callback):
             "train_precision",
             "train_recall",
             "train_f1",
+            "train_best_accuracy",
+            "train_best_threshold",
+            "train_best_f1",
+            "train_best_f1_threshold",
+            "train_accuracy_at_best_f1",
             "val_accuracy",
             "val_bce",
             "val_precision",
@@ -171,6 +176,9 @@ class TrainingMetricsLogger(Callback):
             "val_f1",
             "val_best_accuracy",
             "val_best_threshold",
+            "val_best_f1",
+            "val_best_f1_threshold",
+            "val_accuracy_at_best_f1",
         ):
             record[key] = self._to_float(metrics.get(key))
         self.history.append(record)
@@ -276,7 +284,7 @@ class TFT:
         start_date: Optional[str] = "2015-01-01",
         end_date: Optional[str] = None,
         features_csv: Optional[str] = None,
-        train_fraction: float = 0.8,
+        train_fraction: float = 0.9,
         max_epochs: int = 50,
         learning_rate: float = 1e-3,
         hidden_size: int = 64,
@@ -286,10 +294,14 @@ class TFT:
         lstm_layers: int = 1,
         reduce_on_plateau_patience: int = 8,
         weight_decay: float = 0.0,
+        threshold_min: float = 0.1,
+        threshold_max: float = 0.9,
+        threshold_step: float = 0.01,
+        train_eval_batches: Optional[int] = 10,
         logger_name: Optional[str] = None,
         logger_version: Optional[int] = None,
-        monitor_metric: str = "val_f1",
-        monitor_mode: Optional[Literal["min", "max"]] = None,
+        monitor_metric: str = "val_loss",
+        monitor_mode: Optional[Literal["min", "max"]] = "min",
         seed: Optional[int] = 42,
         early_stopping_patience: int = 10,
     ) -> None:
@@ -303,9 +315,13 @@ class TFT:
         self.task_type = self.task_config["task_type"]
         self.target_column = self.task_config["target"]
         self.classification_threshold = classification_threshold
+        self.threshold_min = float(threshold_min)
+        self.threshold_max = float(threshold_max)
+        self.threshold_step = float(threshold_step)
         self.best_val_threshold: Optional[float] = None
         self.best_val_accuracy: Optional[float] = None
-        self.threshold_grid: List[float] = [x / 100 for x in range(10, 91, 1)]  # 0.10~0.90, step 0.01
+        self.best_val_f1: Optional[float] = None
+        self.threshold_grid: List[float] = self._build_threshold_grid()
         self.start_date = start_date
         self.end_date = end_date
         self.features_csv = Path(features_csv).expanduser() if features_csv else None
@@ -320,6 +336,7 @@ class TFT:
         self.lstm_layers = lstm_layers
         self.reduce_on_plateau_patience = reduce_on_plateau_patience
         self.weight_decay = max(0.0, float(weight_decay))
+        self.train_eval_batches = train_eval_batches
         self.logger_name = logger_name
         # 預設集中到指定版本資料夾（如 version_3），可自行覆寫
         self.logger_version = logger_version
@@ -385,6 +402,21 @@ class TFT:
     # ------------------------------------------------------------------#
     # Data / model helpers
     # ------------------------------------------------------------------#
+    def _build_threshold_grid(self) -> List[float]:
+        """
+        Build threshold candidates for classification metrics sweep.
+        """
+        start = max(0.0, min(1.0, self.threshold_min))
+        end = max(0.0, min(1.0, self.threshold_max))
+        if end < start:
+            start, end = end, start
+        step = max(1e-4, float(self.threshold_step))
+        num_steps = int((end - start) / step) + 1
+        grid = [round(start + i * step, 6) for i in range(num_steps)]
+        if grid and grid[-1] < end:
+            grid.append(round(end, 6))
+        return grid or [0.5]
+
     def _effective_threshold(self) -> float:
         if self.best_val_threshold is not None:
             return float(self.best_val_threshold)
@@ -500,9 +532,14 @@ class TFT:
         if self.training is None:
             raise RuntimeError("Call load_data_external() before creating the model.")
 
-        # Always monitor F1 for checkpoint/early stopping to reflect balanced precision/recall.
-        monitor_metric = "val_f1"
-        monitor_mode = "max"
+        monitor_metric = self.monitor_metric or "val_loss"
+        monitor_mode = self.monitor_mode
+        if monitor_metric == "val_best_f1":
+            monitor_mode = "max"
+        if monitor_mode is None:
+            monitor_mode = "max" if monitor_metric.endswith(("accuracy", "f1")) else "min"
+        self.monitor_metric = monitor_metric
+        self.monitor_mode = monitor_mode
         if self.seed is not None:
             L.seed_everything(self.seed, workers=True)
         early_stop_callback = EarlyStopping(
@@ -539,7 +576,7 @@ class TFT:
         epoch_eval_callback = ClassificationEpochEvaluator(
             owner=self,
             thresholds=self.threshold_grid,
-            train_eval_batches=10,
+            train_eval_batches=self.train_eval_batches,
         )
         callbacks: List[Callback] = [
             lr_logger,
@@ -563,7 +600,8 @@ class TFT:
         self.model = TemporalFusionTransformer.from_dataset(
             self.training,
             learning_rate=self.learning_rate,
-            optimizer_params={"weight_decay": self.weight_decay} if self.weight_decay > 0 else None,
+            optimizer_params=None,  # weight decay is passed separately to avoid duplicate arguments
+            weight_decay=self.weight_decay,
             hidden_size=self.hidden_size,
             attention_head_size=self.attention_head_size,
             dropout=self.dropout,
@@ -622,6 +660,13 @@ class TFT:
             "lstm_layers": self.lstm_layers,
             "reduce_on_plateau_patience": self.reduce_on_plateau_patience,
             "classification_threshold": self.classification_threshold,
+            "best_val_threshold": self.best_val_threshold,
+            "best_val_f1": self.best_val_f1,
+            "best_val_accuracy": self.best_val_accuracy,
+            "threshold_min": self.threshold_min,
+            "threshold_max": self.threshold_max,
+            "threshold_step": self.threshold_step,
+            "train_eval_batches": self.train_eval_batches,
             "weight_decay": self.weight_decay,
             "pos_weight": getattr(self.task_config.get("loss"), "pos_weight", None) if isinstance(self.task_config, dict) else None,
             "start_date": self.start_date,
@@ -751,20 +796,40 @@ class TFT:
         horizon_df = horizon_df.drop_duplicates(subset=["time_idx", "horizon_step"], keep="last")
         actual = horizon_df["actual"].astype(int)
         prob = horizon_df["prob_up"].clip(0, 1)
+        actual_arr = actual.values
+        prob_arr = prob.values
         base_threshold = self._effective_threshold()
-        preds_default = (prob >= base_threshold).astype(int)
-        accuracy = float((preds_default == actual).mean())
+        preds_default = (prob_arr >= base_threshold).astype(int)
+        accuracy = float((preds_default == actual_arr).mean())
         bce_tensor = F.binary_cross_entropy(
-            torch.as_tensor(prob.values, dtype=torch.float32),
-            torch.as_tensor(actual.values, dtype=torch.float32),
+            torch.as_tensor(prob_arr, dtype=torch.float32),
+            torch.as_tensor(actual_arr, dtype=torch.float32),
         )
         best_acc = -1.0
         best_thresh = None
+        best_f1 = -1.0
+        best_f1_thresh = None
+        acc_at_best_f1: Optional[float] = None
         for th in thresholds:
-            acc = float(((prob >= th).astype(int) == actual).mean())
+            preds = (prob_arr >= th).astype(int)
+            acc = float((preds == actual_arr).mean())
+            tp_th = int(((preds == 1) & (actual_arr == 1)).sum())
+            fp_th = int(((preds == 1) & (actual_arr == 0)).sum())
+            fn_th = int(((preds == 0) & (actual_arr == 1)).sum())
+            precision_th = tp_th / (tp_th + fp_th) if (tp_th + fp_th) > 0 else 0.0
+            recall_th = tp_th / (tp_th + fn_th) if (tp_th + fn_th) > 0 else 0.0
+            f1_th = (
+                2 * precision_th * recall_th / (precision_th + recall_th)
+                if (precision_th + recall_th) > 0
+                else 0.0
+            )
             if acc > best_acc:
                 best_acc = acc
                 best_thresh = float(th)
+            if f1_th > best_f1:
+                best_f1 = float(f1_th)
+                best_f1_thresh = float(th)
+                acc_at_best_f1 = acc
         metrics = {
             "accuracy": accuracy,
             "bce": float(bce_tensor.detach().cpu().item()),
@@ -772,6 +837,9 @@ class TFT:
             "prediction_rate": float(preds_default.mean()),
             "best_accuracy": float(best_acc) if best_acc >= 0 else None,
             "best_threshold": best_thresh,
+            "best_f1": float(best_f1) if best_f1 >= 0 else None,
+            "best_f1_threshold": best_f1_thresh,
+            "accuracy_at_best_f1": float(acc_at_best_f1) if acc_at_best_f1 is not None else None,
             "samples": float(len(horizon_df)),
         }
         # precision / recall / f1 at the default threshold
@@ -788,15 +856,16 @@ class TFT:
                 "f1": float(f1),
             }
         )
-        if split == "val" and best_thresh is not None:
+        if split == "val" and best_f1_thresh is not None:
             # Keep the global best validation threshold so later evaluation matches the best checkpoint.
             is_better = (
-                self.best_val_accuracy is None
-                or (best_acc is not None and best_acc > self.best_val_accuracy)
+                self.best_val_f1 is None
+                or (best_f1 is not None and best_f1 > self.best_val_f1)
             )
             if is_better:
-                self.best_val_threshold = best_thresh
+                self.best_val_threshold = best_f1_thresh
                 self.best_val_accuracy = best_acc
+                self.best_val_f1 = best_f1
         return metrics
 
     def _export_training_artifacts(self, save_dir: Optional[str] = None) -> Dict[str, Path]:
@@ -838,11 +907,26 @@ class TFT:
                 df["train_accuracy"] = np.nan
             if "val_accuracy" not in df.columns:
                 df["val_accuracy"] = np.nan
-            for col in ["train_precision", "train_recall", "train_f1", "val_precision", "val_recall", "val_f1"]:
+            for col in [
+                "train_precision",
+                "train_recall",
+                "train_f1",
+                "val_precision",
+                "val_recall",
+                "val_f1",
+                "train_best_accuracy",
+                "train_best_threshold",
+                "train_best_f1",
+                "train_best_f1_threshold",
+                "train_accuracy_at_best_f1",
+                "val_best_accuracy",
+                "val_best_threshold",
+                "val_best_f1",
+                "val_best_f1_threshold",
+                "val_accuracy_at_best_f1",
+            ]:
                 if col not in df.columns:
                     df[col] = np.nan
-            if "val_best_threshold" not in df.columns:
-                df["val_best_threshold"] = np.nan
             metrics_csv = save_root / "training_metrics.csv"
             df.to_csv(metrics_csv, index=False)
             artifacts["metrics_csv"] = metrics_csv
@@ -1078,6 +1162,7 @@ class TFT:
             "threshold_used": threshold,
             "best_val_threshold": self.best_val_threshold,
             "best_val_accuracy": self.best_val_accuracy,
+            "best_val_f1": self.best_val_f1,
         }
         last_window = horizon_df.sort_values("time_idx").tail(min(30, len(horizon_df)))
         summary["last_30_accuracy"] = (
@@ -1353,12 +1438,21 @@ def tft() -> None:
         batch_size=64,
         start_date="2015-01-01",
         train_fraction=0.8,
-        max_epochs=50,
-        learning_rate=1e-3,
-        hidden_size=64,
+        max_epochs=90,
+        learning_rate=8e-4,
+        hidden_size=48,
         attention_head_size=4,
-        hidden_continuous_size=32,
-        dropout=0.1,
+        hidden_continuous_size=24,
+        dropout=0.2,
+        weight_decay=5e-4,
+        pos_weight=0.5,
+        threshold_min=0.2,
+        threshold_max=0.95,
+        threshold_step=0.01,
+        monitor_metric="val_best_f1",
+        monitor_mode="max",
+        early_stopping_patience=15,
+        train_eval_batches=None,
     )
     predictor.load_data_external(export_preview=False, export_full=False)
     predictor.create_tft_model()

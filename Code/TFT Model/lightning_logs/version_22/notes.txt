@@ -1,0 +1,6 @@
+版本: version_22
+設定: encoder_length=120, train_fraction=0.8, dropout=0.15, weight_decay=1e-3, lr=1e-3, pos_weight=0.7(降低正類權重), threshold_grid=0.2-0.8 step 0.01, monitor=val_best_f1。
+結果: best_val_f1=0.7009@epoch5(th=0.40), acc=0.5427, precision=0.5408, recall=0.9957, prediction_rate=0.991, roc_auc=0.496, pr_auc=0.550。F1 比 version_21 微增，但準確率仍低。
+觀察: 預測仍偏向全正類，AUC 低於 0.5，表示排序能力仍弱；pos_weight 下調並未有效提升精確度，最佳閾值仍落在較低門檻並產生過高的正類比。
+可能問題: 模型仍未學到可區分特徵，BCE loss 可能過於平滑；encoder 長度變長但未改善 AUC，正則化/權重配置仍讓 logits 集中於 0.4~0.6 區間。
+下一步: 再降低正類權重(例如 0.5)或採用 focal loss/label smoothing 提升區分度；嘗試提高門檻掃描上限至 0.9 並以精確度為輔助指標；可縮小 hidden_size 或 encoder_length 以降低模型容量，觀察 AUC 是否上升。

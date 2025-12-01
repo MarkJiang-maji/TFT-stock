@@ -1,0 +1,6 @@
+版本: version_21
+設定: encoder_length=90, train_fraction=0.85, dropout=0.2, weight_decay=1e-3, lr=5e-4, threshold_grid=0.3-0.65 step 0.005, monitor=val_best_f1, early_stop=12, 無 pos_weight。
+結果: best_val_f1=0.6919@epoch0(th=0.46), acc=0.5313, precision=0.5290, recall=1.0, prediction_rate=0.995, roc_auc=0.507, pr_auc=0.560。最佳檢查點仍落在最早期，後續 F1 沒再提升。
+觀察: 模型幾乎把所有樣本判成正類(>99% positive)，導致高召回但低精確度；AUC ~0.50，排序能力仍近乎隨機，weight_decay/dropout 降低了過擬合但沒有增加訊號。
+可能問題: 閾值掃描上限只有0.65，未能測高門檻；loss/特徵仍不足以區分正負，pos_weight 未調整造成偏向正類。
+下一步: 放寬閾值掃描至0.8-0.9，嘗試降低正類權重(pos_weight<1)或其他正則化組合，並觀察是否能提升精確度/ROC；必要時降低模型容量或改回較長 encoder 以提升排序能力。

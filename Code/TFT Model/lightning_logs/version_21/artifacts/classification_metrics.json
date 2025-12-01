@@ -1,0 +1,20 @@
+{
+  "samples": 399,
+  "overall_accuracy": 0.531328320802005,
+  "positive_rate": 0.5263157894736842,
+  "prediction_rate": 0.9949874686716792,
+  "threshold_used": 0.46,
+  "best_val_threshold": 0.46,
+  "best_val_accuracy": 0.531328320802005,
+  "best_val_f1": 0.6919275123558484,
+  "last_30_accuracy": 0.6333333333333333,
+  "true_positives": 210,
+  "false_positives": 187,
+  "true_negatives": 2,
+  "false_negatives": 0,
+  "precision": 0.5289672544080605,
+  "recall": 1.0,
+  "f1": 0.6919275123558484,
+  "roc_auc": 0.5069538926681784,
+  "pr_auc": 0.5601333446585725
+}

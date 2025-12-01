@@ -1,0 +1,65 @@
+{
+  "task_type": "classification",
+  "target_column": "target_intraday_up",
+  "prediction_length": 1,
+  "encoder_length": 90,
+  "future_horizon": 30,
+  "train_fraction": 0.85,
+  "batch_size": 64,
+  "max_epochs": 70,
+  "learning_rate": 0.0005,
+  "hidden_size": 64,
+  "attention_head_size": 4,
+  "hidden_continuous_size": 32,
+  "dropout": 0.2,
+  "lstm_layers": 1,
+  "reduce_on_plateau_patience": 8,
+  "classification_threshold": 0.5,
+  "best_val_threshold": null,
+  "best_val_f1": null,
+  "best_val_accuracy": null,
+  "threshold_min": 0.3,
+  "threshold_max": 0.65,
+  "threshold_step": 0.005,
+  "train_eval_batches": 12,
+  "weight_decay": 0.001,
+  "pos_weight": null,
+  "start_date": "2015-01-01",
+  "end_date": null,
+  "features_csv": null,
+  "device": "NVIDIA GeForce RTX 4090",
+  "logger_version": 20,
+  "monitor_metric": "val_best_f1",
+  "monitor_mode": "max",
+  "seed": 42,
+  "early_stopping_patience": 12,
+  "splits": {
+    "train": {
+      "time_idx_min": 0,
+      "time_idx_max": 3350,
+      "date_start": "2015-01-05",
+      "date_end": "2024-03-08"
+    },
+    "val": {
+      "time_idx_min": 3353,
+      "time_idx_max": 3944,
+      "date_start": "2024-03-11",
+      "date_end": "2025-10-23"
+    },
+    "future": {
+      "time_idx_min": 3945,
+      "time_idx_max": 3974,
+      "date_start": "2025-10-27",
+      "date_end": "2025-12-05"
+    }
+  },
+  "dataset": {
+    "num_rows": 2640,
+    "date_start": "2015-01-05",
+    "date_end": "2025-10-23",
+    "start_date": "2015-01-01",
+    "end_date": null,
+    "train_fraction": 0.85,
+    "features_csv": null
+  }
+}

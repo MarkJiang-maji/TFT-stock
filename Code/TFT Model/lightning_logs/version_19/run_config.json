@@ -1,0 +1,90 @@
+{
+  "task_type": "classification",
+  "target_column": "target_intraday_up",
+  "prediction_length": 1,
+  "encoder_length": 120,
+  "future_horizon": 30,
+  "train_fraction": 0.8,
+  "batch_size": 64,
+  "max_epochs": 50,
+  "learning_rate": 0.001,
+  "hidden_size": 64,
+  "attention_head_size": 4,
+  "hidden_continuous_size": 32,
+  "dropout": 0.1,
+  "lstm_layers": 1,
+  "reduce_on_plateau_patience": 8,
+  "classification_threshold": 0.5,
+  "best_val_threshold": 0.44,
+  "best_val_f1": 0.7067901234567903,
+  "best_val_accuracy": 0.5612009237875288,
+  "weight_decay": 0.0,
+  "pos_weight": null,
+  "start_date": "2015-01-01",
+  "end_date": null,
+  "features_csv": null,
+  "device": "NVIDIA GeForce RTX 4090",
+  "logger_version": 19,
+  "monitor_metric": "val_loss",
+  "monitor_mode": "min",
+  "seed": 42,
+  "early_stopping_patience": 10,
+  "splits": {
+    "train": {
+      "time_idx_min": 0,
+      "time_idx_max": 3154,
+      "date_start": "2015-01-05",
+      "date_end": "2023-08-25"
+    },
+    "val": {
+      "time_idx_min": 3157,
+      "time_idx_max": 3944,
+      "date_start": "2023-08-28",
+      "date_end": "2025-10-23"
+    },
+    "future": {
+      "time_idx_min": 3945,
+      "time_idx_max": 3974,
+      "date_start": "2025-10-27",
+      "date_end": "2025-12-05"
+    }
+  },
+  "dataset": {
+    "num_rows": 2640,
+    "date_start": "2015-01-05",
+    "date_end": "2025-10-23",
+    "start_date": "2015-01-01",
+    "end_date": null,
+    "train_fraction": 0.8,
+    "features_csv": null
+  },
+  "training": {
+    "best_checkpoint": "/mnt/c/Users/A52560/Documents/GitHub/TFT-stock/Code/TFT Model/lightning_logs/version_19/checkpoints/tft-47-0.0029.ckpt",
+    "best_monitor_score": 0.0028937640599906445,
+    "best_epoch": 47,
+    "actual_max_epochs": 50,
+    "epochs_trained": 51,
+    "monitor_metric": "val_loss",
+    "monitor_mode": "min"
+  },
+  "last_evaluation": {
+    "samples": 433,
+    "overall_accuracy": 0.5334872979214781,
+    "positive_rate": 0.5381062355658198,
+    "prediction_rate": 0.6535796766743649,
+    "threshold_used": 0.44,
+    "best_val_threshold": 0.44,
+    "best_val_accuracy": 0.5612009237875288,
+    "best_val_f1": 0.7067901234567903,
+    "last_30_accuracy": 0.6333333333333333,
+    "true_positives": 157,
+    "false_positives": 126,
+    "true_negatives": 74,
+    "false_negatives": 76,
+    "precision": 0.5547703180212014,
+    "recall": 0.6738197424892703,
+    "f1": 0.6085271317829456,
+    "roc_auc": 0.5016952789699571,
+    "pr_auc": 0.5363830667752643
+  }
+}
